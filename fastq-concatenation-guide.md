@@ -1,6 +1,8 @@
-# How to Concatenate FASTQ Files
+# How to Concatenate FASTQ/FASTA Files
 
-This guide explains how to combine multiple FASTQ files from a directory (including all subdirectories) into a single compressed file.
+This guide explains how to combine multiple FASTQ or FASTA files from a directory (including all subdirectories) into a single compressed file.
+
+> **Note:** These same commands work for FASTA files as well. Simply replace the file extensions (e.g., `*.fastq` becomes `*.fasta` or `*.fa`).
 
 ## Linux / macOS
 
