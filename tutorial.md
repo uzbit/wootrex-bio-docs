@@ -8,13 +8,14 @@ This tutorial will guide you through using the NGS Diversity Analysis platform t
 2. [Getting Started](#getting-started)
 3. [Working with Projects](#working-with-projects)
 4. [Uploading and Managing Files](#uploading-and-managing-files)
-5. [Running Analyses](#running-analyses)
+5. [File Types Reference](#file-types-reference)
+6. [Running Analyses](#running-analyses)
    - [Demultiplexing](#demultiplexing)
    - [Clustering](#clustering)
    - [Diversity Analysis](#diversity-analysis)
-6. [Monitoring Jobs and Viewing Results](#monitoring-jobs-and-viewing-results)
-7. [Complete Workflow Example](#complete-workflow-example)
-8. [Tips and Best Practices](#tips-and-best-practices)
+7. [Monitoring Jobs and Viewing Results](#monitoring-jobs-and-viewing-results)
+8. [Complete Workflow Example](#complete-workflow-example)
+9. [Tips and Best Practices](#tips-and-best-practices)
 
 ---
 
@@ -27,6 +28,16 @@ The NGS Diversity Analysis platform provides a complete pipeline for analyzing g
 - **Diversity Analysis**: Calculate diversity metrics (richness, Shannon index, Simpson index) for each sample
 
 The platform is organized around **Projects**, which contain your uploaded **Files** and analysis **Jobs**.
+
+### Pipeline Overview
+
+```
+FASTQ Reads ──────┐
+                  ├──► Demultiplexing ──► Demux Results ─────┐
+Barcode FASTA ────┘                                          │
+                                                             ├──► Diversity Analysis
+Reference FASTA ──────► Clustering ──────► Cluster DB ───────┘
+```
 
 ---
 
@@ -85,27 +96,6 @@ Within each project, you can:
 
 Before running any analysis, you need to upload your input files.
 
-### Supported File Types
-
-| Category | File Types | Requirements |
-|----------|-----------|--------------|
-| **FASTQ Reads** | Nanopore, Illumina, PacBio | Must be compressed (.gz or .zip) |
-| **FASTA Sequences** | Barcodes, Target sequences, Adapter sequences, Other | Can be compressed or uncompressed |
-| **Result Files** | Demux results, Cluster databases, Analysis results | ZIP archives |
-
-### Preparing Your Files
-
-**FASTQ files** must be compressed before uploading. If you have multiple FASTQ files from the same sample that need to be combined, see our [FASTQ Concatenation Guide](fastq-concatenation-guide.md) for instructions.
-
-**FASTA files** containing your barcodes should have one sequence per barcode, with the header line containing the barcode/sample name:
-
-```
->Sample_01
-ACGTACGTACGT
->Sample_02
-TGCATGCATGCA
-```
-
 ### Uploading Files
 
 1. Navigate to your project
@@ -130,6 +120,219 @@ In the Files tab, you can:
 
 ---
 
+## File Types Reference
+
+This section provides detailed information about each file type supported by the platform, including format requirements and where they are used in the analysis pipeline.
+
+### Quick Reference
+
+| Category | File Types | Compression | Used In |
+|----------|-----------|-------------|---------|
+| FASTQ Reads | Nanopore, Illumina, PacBio | Required (.gz or .zip) | Demultiplexing |
+| FASTA Sequences | Barcodes, Target, Exclude, Adapter, Other | Optional | Demultiplexing, Clustering |
+| Result Files | Demux Results, Cluster DB, Diversity Results | ZIP format | Diversity Analysis |
+
+---
+
+### FASTQ Read Files
+
+FASTQ files contain your raw sequencing reads. These files **must be compressed** before uploading.
+
+#### Supported Types
+
+| File Type | Description | Platform |
+|-----------|-------------|----------|
+| FASTQ Reads (Nanopore) | Long-read sequencing data | Oxford Nanopore |
+| FASTQ Reads (Illumina) | Short-read sequencing data | Illumina |
+| FASTQ Reads (PacBio) | Long-read sequencing data | Pacific Biosciences |
+
+#### File Requirements
+
+- **Accepted Extensions**: `.fastq.gz`, `.fq.gz`, `.fastq.zip`, `.fq.zip`
+- **Compression**: **REQUIRED** - Files must be gzip or zip compressed
+- **Format**: Standard FASTQ format
+
+#### FASTQ Format Example
+
+Each read consists of 4 lines:
+
+```
+@Read_001
+ACGTACGTACGTACGTACGTACGT
++
+IIIIIIIIIIIIIIIIIIIIIII
+```
+
+- **Line 1**: Header starting with `@` followed by read identifier
+- **Line 2**: DNA sequence
+- **Line 3**: Plus sign (optionally followed by description)
+- **Line 4**: Quality scores (ASCII-encoded, same length as sequence)
+
+#### Preparing FASTQ Files
+
+If you have multiple FASTQ files from the same sample, combine them before uploading. See our [FASTQ Concatenation Guide](fastq-concatenation-guide.md) for detailed instructions.
+
+**Quick commands:**
+
+```bash
+# Combine and compress with gzip (Linux/macOS)
+cat your_directory/*.fastq | gzip > combined_reads.fastq.gz
+
+# Or use zip
+cat your_directory/*.fastq > combined_reads.fastq
+zip combined_reads.fastq.zip combined_reads.fastq
+```
+
+#### Used In
+- **Demultiplexing**: Primary input - reads are assigned to barcodes
+
+---
+
+### FASTA Sequence Files
+
+FASTA files contain sequence data for barcodes, reference sequences, or other purposes. These files can be uploaded compressed or uncompressed.
+
+#### Supported Types
+
+| File Type | Description | Used For |
+|-----------|-------------|----------|
+| ONT Barcodes | Barcode sequences for sample identification | Demultiplexing (required) |
+| Target Sequences | Reference sequences to cluster against | Clustering |
+| Exclude Sequences | Sequences to exclude from analysis | Clustering |
+| Adapter Sequences | Adapter/primer sequences for filtering | Clustering |
+| Other Sequences | General-purpose sequence files | Clustering |
+
+#### File Requirements
+
+- **Accepted Extensions**:
+  - Uncompressed: `.fasta`, `.fa`, `.fna`
+  - Compressed: `.fasta.gz`, `.fa.gz`, `.fna.gz`, `.fasta.zip`, `.fa.zip`, `.fna.zip`
+- **Compression**: **OPTIONAL** - Files can be uploaded with or without compression
+- **Format**: Standard FASTA format
+
+#### FASTA Format Example
+
+```
+>Barcode_01
+ACGTACGTACGT
+>Barcode_02
+TGCATGCATGCA
+>Barcode_03
+GCTAGCTAGCTA
+```
+
+- **Header Line**: Starts with `>` followed by sequence name/identifier
+- **Sequence Lines**: DNA sequence (can span multiple lines)
+
+#### Barcode File Best Practices
+
+When creating barcode files for demultiplexing:
+
+1. **Use unique names**: Each barcode header should have a unique, descriptive name
+2. **Keep sequences clean**: Include only the barcode sequence, not adapters
+3. **Verify sequences**: Double-check barcode sequences match your wet lab design
+4. **One barcode per entry**: Each FASTA entry represents one sample barcode
+
+**Example barcode file:**
+
+```
+>Sample_Control
+ACACACAC
+>Sample_Treatment_1
+GTGTGTGT
+>Sample_Treatment_2
+TCTCTCTC
+>Sample_Treatment_3
+AGAGAGAG
+```
+
+#### Used In
+- **Demultiplexing**: ONT Barcodes (required input)
+- **Clustering**: Target, Exclude, Adapter, and Other sequences
+
+---
+
+### Result Files (ZIP Archives)
+
+Result files are ZIP archives generated by analysis jobs. They can also be uploaded to reuse results from previous analyses.
+
+#### Supported Types
+
+| File Type | Generated By | Contains | Used As Input For |
+|-----------|--------------|----------|-------------------|
+| Demultiplex Results | Demultiplexing job | Per-barcode reads, statistics | Diversity Analysis |
+| Clustered Database | Clustering job | Cluster definitions, centroids | Diversity Analysis |
+| Diversity Analysis Results | Diversity Analysis job | Diversity metrics per sample | - |
+
+#### File Requirements
+
+- **Accepted Extension**: `.zip`
+- **Format**: Valid ZIP archive
+
+#### Demultiplex Results Contents
+
+When you run a demultiplexing job, the output ZIP contains:
+- Reads separated by barcode
+- Summary statistics
+- Per-barcode read counts
+
+#### Clustered Database Contents
+
+When you run a clustering job, the output ZIP contains:
+- `clusters.json` - Cluster definitions (required)
+- `clusters.fasta` - Representative sequences (optional)
+
+The `clusters.json` file has this structure:
+
+```json
+{
+  "clusters": [
+    {
+      "id": "cluster_001",
+      "centroid": "ACGTACGT...",
+      "sequences": [
+        {"id": "seq_001"},
+        {"id": "seq_002"}
+      ]
+    }
+  ]
+}
+```
+
+#### Uploading Result Files
+
+You can upload result files from previous analyses to:
+- Rerun diversity analysis with different parameters
+- Use results from external tools
+- Share results between projects
+
+> **Note**: When uploading a Clustered Database ZIP, the system validates the `clusters.json` structure before accepting the file.
+
+#### Used In
+- **Diversity Analysis**: Requires both Demux Results and Cluster DB as inputs
+
+---
+
+### File Type Usage Matrix
+
+This table shows which file types are used in each analysis job:
+
+| File Type | Demultiplexing | Clustering | Diversity Analysis |
+|-----------|:--------------:|:----------:|:------------------:|
+| FASTQ Reads (Nanopore) | INPUT | - | - |
+| FASTQ Reads (Illumina) | INPUT | - | - |
+| FASTQ Reads (PacBio) | INPUT | - | - |
+| ONT Barcodes (FASTA) | INPUT (required) | - | - |
+| Target Sequences (FASTA) | - | INPUT | - |
+| Exclude Sequences (FASTA) | - | INPUT | - |
+| Adapter Sequences (FASTA) | - | INPUT | - |
+| Other Sequences (FASTA) | - | INPUT | - |
+| Demultiplex Results (ZIP) | OUTPUT | - | INPUT (required) |
+| Clustered Database (ZIP) | - | OUTPUT | INPUT (required) |
+| Diversity Results (ZIP) | - | - | OUTPUT |
+
+---
+
 ## Running Analyses
 
 From the "Jobs" tab in your project, click "Create Job" to start a new analysis.
@@ -142,10 +345,10 @@ This is typically the first step when processing multiplexed sequencing data.
 
 #### Required Inputs
 
-| Input | Description |
-|-------|-------------|
-| Input FASTQ File | Your compressed sequencing reads |
-| Barcode FASTA File | FASTA file containing your sample barcodes |
+| Input | File Type | Description |
+|-------|-----------|-------------|
+| Input FASTQ File | FASTQ Reads (Nanopore/Illumina/PacBio) | Your compressed sequencing reads |
+| Barcode FASTA File | ONT Barcodes (FASTA) | FASTA file containing your sample barcodes |
 
 #### Parameters
 
@@ -173,9 +376,9 @@ Use this to cluster your reference sequences or to reduce redundancy in sequence
 
 #### Required Inputs
 
-| Input | Description |
-|-------|-------------|
-| Input Reference FASTA | FASTA file containing sequences to cluster |
+| Input | File Type | Description |
+|-------|-----------|-------------|
+| Input Reference FASTA | Target/Exclude/Adapter/Other Sequences | FASTA file containing sequences to cluster |
 
 #### Basic Parameters
 
@@ -210,10 +413,10 @@ This analysis combines your clustering results with demultiplexing results to me
 
 #### Required Inputs
 
-| Input | Description |
-|-------|-------------|
-| Cluster Result | Output from a previous Clustering job |
-| Demux Result | Output from a previous Demultiplexing job |
+| Input | File Type | Description |
+|-------|-----------|-------------|
+| Cluster Result | Clustered Database (ZIP) | Output from a previous Clustering job |
+| Demux Result | Demultiplex Results (ZIP) | Output from a previous Demultiplexing job |
 
 #### Basic Parameters
 
@@ -303,9 +506,9 @@ Here's a typical end-to-end analysis workflow:
 ### Step 2: Upload Your Files
 
 1. Go to the Files tab
-2. Upload your compressed FASTQ reads (e.g., `reads.fastq.gz`)
-3. Upload your barcode FASTA file (e.g., `barcodes.fasta`)
-4. Upload your reference sequences (e.g., `reference.fasta`)
+2. Upload your compressed FASTQ reads (e.g., `reads.fastq.gz`) - select "FASTQ Reads (Nanopore)"
+3. Upload your barcode FASTA file (e.g., `barcodes.fasta`) - select "ONT Barcodes"
+4. Upload your reference sequences (e.g., `reference.fasta`) - select "Target Sequences"
 
 ### Step 3: Run Demultiplexing
 
@@ -350,6 +553,7 @@ Here's a typical end-to-end analysis workflow:
 - **Combine FASTQ files** from the same sample before uploading (see [FASTQ Concatenation Guide](fastq-concatenation-guide.md))
 - **Compress large files** using gzip for faster uploads
 - **Use descriptive names** for your files to easily identify them later
+- **Verify barcode sequences** match your experimental design
 
 ### Parameter Tuning
 
@@ -372,8 +576,10 @@ Here's a typical end-to-end analysis workflow:
 |-------|---------------|----------|
 | Low barcode assignment rate | Barcodes not matching | Check barcode sequences, try reverse complement, increase max errors |
 | Job fails immediately | Invalid file format | Verify file is correctly formatted FASTQ/FASTA |
+| Upload fails | File not compressed | Ensure FASTQ files are .gz or .zip compressed |
 | Very slow processing | Large file size | Use Max Reads to limit processing, or wait for completion |
 | No diversity results | No reads mapped | Check identity threshold, ensure reference matches your samples |
+| Cluster upload rejected | Invalid clusters.json | Verify ZIP contains properly formatted clusters.json |
 
 ### Best Practices
 
