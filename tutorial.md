@@ -8,6 +8,7 @@ This tutorial will guide you through using the NGS Diversity Analysis platform t
 2. [Getting Started](#getting-started)
 3. [Working with Projects](#working-with-projects)
 4. [Uploading and Managing Files](#uploading-and-managing-files)
+   - [Pinned Files](#pinned-files)
 5. [Running Analyses](#running-analyses)
    - [Demultiplexing](#demultiplexing)
    - [Clustering](#clustering)
@@ -127,6 +128,38 @@ In the Files tab, you can:
 - **Delete** files you no longer need
 
 > **Note**: Files associated with active or completed jobs cannot be deleted until those jobs are removed.
+
+### Pinned Files
+
+Files are automatically deleted after 60 days to manage storage costs. If you have important files you want to keep permanently (like reference sequences or barcode files), you can **pin** them.
+
+#### What Pinning Does
+
+- **Prevents automatic deletion**: Pinned files are protected from the 60-day lifecycle rule
+- **Cross-project access**: Pinned files appear in ALL your projects, making them easy to reuse
+- **Available in job dropdowns**: When creating jobs, pinned files from other projects appear in the file selection dropdowns
+
+#### How to Pin/Unpin Files
+
+1. Navigate to the Files tab in any project
+2. Find the file you want to pin
+3. Click the **pin icon** in the Actions column
+4. The file status will change to "Pinned" (blue badge)
+5. To unpin, click the pin icon again
+
+#### Cross-Project File Sharing
+
+When you pin a file, it becomes available across all your projects:
+
+- **In file lists**: Pinned files from other projects appear in a separate section at the top labeled "Pinned Files from Other Projects"
+- **In job creation**: When selecting files for a job, pinned files from other projects appear in the dropdown with their source project name, e.g., `reference.fasta (from Lab Samples)`
+
+This is useful for:
+- Sharing reference sequences across multiple experiments
+- Reusing barcode files without re-uploading
+- Maintaining a library of commonly used files
+
+> **Note**: You cannot delete a pinned file. Unpin it first if you need to remove it.
 
 ---
 
