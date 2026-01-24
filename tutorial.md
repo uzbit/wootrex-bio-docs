@@ -196,6 +196,37 @@ This is typically the first step when processing multiplexed sequencing data.
 - **Per-barcode counts**: Breakdown of reads per sample
 - **Downloadable files**: Summary file and demux archive (ZIP)
 
+#### Methods
+
+The demultiplexer assigns reads to sample barcodes using a fast approximate matching strategy implemented in the C++ core.
+
+**Barcode Matching Algorithm:**
+
+1. **Exact Substring Matching (Fast Path):** The algorithm first searches for exact barcode sequences within reads using standard string search. This handles the majority of reads efficiently.
+
+2. **Fuzzy Matching (When max_errors > 0):** For reads that don't match exactly, the algorithm performs Hamming distance-based matching:
+   - Tests barcode at the start position first (most common location)
+   - Tests barcode at the end position second
+   - For `max_errors >= 2`, performs a sliding window search across the entire read
+   - Accepts matches where `Hamming distance <= max_errors`
+
+3. **Reverse Complement Checking:** When enabled, both the forward and reverse complement of each barcode are tested against each read position.
+
+**Quality Filtering:**
+
+Reads are filtered based on average PHRED quality scores:
+```
+Q = mean(char - 33) for all quality characters
+```
+Where 33 is the PHRED33 offset. Reads with `Q >= min_quality` are classified as "pass", others as "fail". Both categories are written to separate output directories.
+
+**Parallelization:**
+
+- Reads are processed in batches of 10,000
+- Barcode matching is parallelized across threads using OpenMP
+- File writes are sequential to avoid I/O conflicts
+- Progress is reported every 10,000 reads
+
 #### Performance
 
 | Aspect | Details |
@@ -246,6 +277,61 @@ Use this to cluster your reference sequences or to reduce redundancy in sequence
 - **Unique Sequences**: Sequences after clustering
 - **Compression Ratio**: Reduction achieved by clustering
 - **Downloadable files**: Cluster archive (ZIP)
+
+#### Methods
+
+The clustering module implements a **greedy minimizer-based clustering** approach designed for fast, approximate sequence clustering while maintaining biological accuracy.
+
+**Step 1: Sequence Deduplication**
+
+Before clustering, exact duplicate sequences are removed to reduce computational load. Duplicate counts are tracked and multiplied into final cluster sizes.
+
+**Step 2: Minimizer Extraction**
+
+Minimizers are small sequence signatures used for fast similarity detection without full alignment:
+
+1. For each sequence, a sliding window of size `w` moves across the sequence
+2. Within each window, the lexicographically smallest k-mer (of length `k`) is selected
+3. The set of unique minimizers forms a compact "sketch" of the sequence
+4. Sequences sharing many minimizers are likely to be similar
+
+```
+Example (k=4, w=3):
+Sequence: ACGTACGTAC
+Windows:  [ACGT] [CGTA] [GTAC] [TACG] [ACGT] [CGTA] [GTAC]
+Minimizers selected: {ACGT, CGTA, GTAC, TACG}
+```
+
+**Step 3: Candidate Selection**
+
+For each new sequence, potential cluster matches are identified:
+1. Find all existing clusters that share minimizers with the new sequence
+2. Count shared minimizers for each candidate cluster
+3. Filter candidates by `min_shared_minimizers` threshold
+4. Sort candidates by shared minimizer count (descending)
+
+This reduces comparisons from O(n²) to O(n × candidates).
+
+**Step 4: Identity Verification**
+
+Top candidates are verified using edit distance (edlib library):
+1. **Length filter:** Reject if length difference makes threshold impossible
+2. **Edit distance:** Compute using edlib's fast algorithm
+3. **Identity calculation:** `identity = (max_len - edit_distance) / max_len`
+4. Accept if `identity >= identity_threshold`
+
+**Step 5: Greedy Assignment**
+
+- The first sequence becomes the first cluster centroid
+- Each subsequent sequence is assigned to the first matching cluster, or creates a new cluster
+- The most abundant sequence in each cluster becomes the centroid
+- A minimizer index (minimizer → cluster IDs) is maintained for fast lookups
+
+**Parallelization:**
+
+- Sequences are divided into batches
+- Candidate finding and identity testing run in parallel (OpenMP)
+- Cluster assignments are sequential to prevent race conditions
 
 #### Performance
 
@@ -309,6 +395,77 @@ For each barcode/sample:
 | Shannon Index | Diversity measure (higher = more diverse) |
 | Simpson Index | Probability two random reads are different |
 | Evenness | How evenly reads are distributed |
+
+#### Methods
+
+The diversity analyzer maps reads to reference database clusters and computes ecological diversity metrics. The pipeline consists of several stages.
+
+**Step 1: Cluster Database Loading**
+
+The cluster database (from a previous clustering job) is loaded from JSON format:
+- Cluster centroids become the reference sequences
+- Optional filtering by `min_cluster_size` removes small clusters
+- An in-memory index enables O(1) cluster lookups
+
+**Step 2: BLAST Database Creation**
+
+A BLAST database is created from cluster centroids:
+- Uses `makeblastdb` with nucleotide type
+- Hash-based sequence IDs ensure BLAST compatibility
+- Database is cached and reused across barcodes
+
+**Step 3: Read Mapping**
+
+Reads are mapped to clusters using BLAST megablast:
+
+| BLAST Parameter | Value | Purpose |
+|-----------------|-------|---------|
+| Task | megablast | Optimized for long sequences |
+| Word size | 16 | Balance speed vs. sensitivity |
+| Query coverage | 60% minimum | Ensure significant overlap |
+| E-value | 1e-20 | Filter weak matches |
+| Max targets | `max_candidates` | Limit hits per read |
+
+For each read:
+1. BLAST returns candidate cluster matches
+2. Matches are filtered by `identity_threshold`
+3. Best hit (highest identity) is selected
+4. Read is assigned to that cluster
+
+Reads are processed in batches of 5,000 for efficiency.
+
+**Step 4: Read Pre-clustering (Optional)**
+
+When enabled (`cluster_reads=true`), similar reads are grouped before BLAST mapping:
+- Uses the same minimizer-based clustering algorithm
+- More permissive parameters (k=11, w=5, identity=0.85) for error tolerance
+- Cluster representatives are mapped to the database
+- Read counts are weighted by cluster size
+- Reduces BLAST queries by 50-90% for redundant data
+
+**Step 5: Diversity Metric Calculation**
+
+For each barcode/sample, ecological diversity indices are computed:
+
+| Metric | Formula | Interpretation |
+|--------|---------|----------------|
+| **Richness (S)** | Count of unique clusters | Number of distinct sequences |
+| **Shannon Index (H')** | -Σ(pᵢ × ln(pᵢ)) | Higher = more diverse |
+| **Simpson Index (1-D)** | 1 - Σ(pᵢ²) | Probability two reads differ |
+| **Pielou's Evenness (J')** | H' / ln(S) | How evenly distributed (0-1) |
+
+Where pᵢ = (reads in cluster i) / (total reads)
+
+**Example Calculation:**
+```
+Sample with 100 reads across 3 clusters: [50, 30, 20]
+p = [0.5, 0.3, 0.2]
+
+Richness = 3
+Shannon  = -(0.5×ln(0.5) + 0.3×ln(0.3) + 0.2×ln(0.2)) = 1.03
+Simpson  = 1 - (0.5² + 0.3² + 0.2²) = 0.62
+Evenness = 1.03 / ln(3) = 0.94
+```
 
 #### Performance
 
