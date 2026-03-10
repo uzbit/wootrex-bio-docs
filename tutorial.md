@@ -127,8 +127,6 @@ In the Files tab, you can:
 - **Download** files for local use
 - **Delete** files you no longer need
 
-> **Note**: Files associated with active or completed jobs cannot be deleted until those jobs are removed.
-
 ### Pinned Files
 
 Files are automatically deleted after 60 days to manage storage costs. If you have important files you want to keep permanently (like reference sequences or barcode files), you can **pin** them.
@@ -185,8 +183,7 @@ This is typically the first step when processing multiplexed sequencing data.
 | Parameter | Range | Default | Description |
 |-----------|-------|---------|-------------|
 | Minimum Quality Score | 0-50 | 18.0 | Minimum average quality score for a read to be processed |
-| Maximum Errors | 0-3 | 0 | Maximum number of errors allowed when matching barcodes |
-| Check Reverse Complement | On/Off | On | Also check reverse complement of barcodes |
+| Maximum Errors | 0+ | 0 | Maximum number of errors allowed when matching barcodes |
 
 #### Outputs
 
@@ -198,47 +195,72 @@ This is typically the first step when processing multiplexed sequencing data.
 
 #### Methods
 
-The demultiplexer assigns reads to sample barcodes using a fast approximate matching strategy implemented in the C++ core.
+The demultiplexer assigns reads to sample barcodes using a two-stage approximate matching strategy implemented in C++.
 
-**Barcode Matching Algorithm:**
+**Step 1: Barcode Loading and Grouping**
 
-1. **Exact Substring Matching (Fast Path):** The algorithm first searches for exact barcode sequences within reads using standard string search. This handles the majority of reads efficiently.
+Barcodes are loaded from a FASTA file and grouped by normalized name. Orientation suffixes (`_FWD`, `_REV`, `_REVCOMP`, case-insensitive) are stripped so that all orientation variants of a barcode are searched together. Reverse complements are **not** computed at runtime — they must be provided as separate entries in the barcode FASTA file. All barcode sequences are uppercased on load.
 
-2. **Fuzzy Matching (When max_errors > 0):** For reads that don't match exactly, the algorithm performs Hamming distance-based matching:
-   - Tests barcode at the start position first (most common location)
-   - Tests barcode at the end position second
-   - For `max_errors >= 2`, performs a sliding window search across the entire read
-   - Accepts matches where `Hamming distance <= max_errors`
+**Step 2: Barcode Matching**
 
-3. **Reverse Complement Checking:** When enabled, both the forward and reverse complement of each barcode are tested against each read position.
+For each read, the sequence is uppercased and tested against every barcode group. Matching proceeds in two stages:
 
-**Quality Filtering:**
+1. **Exact Substring Search (fast path):** `std::string::find()` searches for the barcode anywhere within the read. On the first exact match found, the read is immediately assigned to that barcode.
 
-Reads are filtered based on average PHRED quality scores:
+2. **Hamming Distance Matching (when `max_errors > 0`):** If no exact match is found and fuzzy matching is enabled, Hamming distance is computed at specific read positions:
+   - **Position 0** (read start) — tested first, as barcodes most commonly appear here
+   - **Position `read_length - barcode_length`** (read end) — tested second
+   - **Sliding window across all positions** — tested only when `max_errors >= 2`
+   - A match is accepted if `Hamming distance <= max_errors`
+
+The Hamming distance function compares characters without early termination, yielding O(B) per position where B is barcode length.
+
+**Ambiguous match handling:** The first matching barcode in iteration order is returned. No confidence scoring or best-match selection is performed. Reads matching no barcode are classified as "unclassified."
+
+**Step 3: Quality Filtering**
+
+Reads are classified as "pass" or "fail" based on average PHRED quality scores:
+
 ```
-Q = mean(char - 33) for all quality characters
+Q_avg = (1/n) × Σᵢ (ASCII(qᵢ) - 33)
 ```
-Where 33 is the PHRED33 offset. Reads with `Q >= min_quality` are classified as "pass", others as "fail". Both categories are written to separate output directories.
+
+Where 33 is the PHRED33 offset (Illumina 1.8+, Nanopore standard). Reads with `Q_avg >= min_quality` (default 18.0) are classified as "pass"; all others as "fail." Both categories are written to separate output subdirectories, preserving the full original read and quality string without trimming.
+
+**Step 4: Output**
+
+Demultiplexed reads are organized into a directory hierarchy:
+```
+output_dir/
+├── barcode01/pass/reads.fastq
+│            /fail/reads.fastq
+├── barcode02/pass/reads.fastq
+│            /fail/reads.fastq
+├── unclassified/pass/reads.fastq
+│               /fail/reads.fastq
+└── demux_summary.txt
+```
+
+Barcode directory names are normalized (e.g., `NB01` → `barcode01`). Output file handles are lazily created and cached to avoid repeated file opens.
 
 **Parallelization:**
 
-- Reads are processed in batches of 10,000
-- Barcode matching is parallelized across threads using OpenMP
-- File writes are sequential to avoid I/O conflicts
-- Progress is reported every 10,000 reads
+- Reads are streamed from the input FASTQ in batches of 10,000
+- Barcode matching and quality scoring are parallelized across threads using [OpenMP](https://www.openmp.org/) (`schedule(dynamic)`)
+- File writes are sequential (single-threaded) to prevent I/O conflicts
+- Thread count is auto-detected via `std::thread::hardware_concurrency()`
 
 #### Performance
 
 | Aspect | Details |
 |--------|---------|
-| **Complexity** | O(N × B × R) |
+| **Complexity** | O(N × B × R) per exact match; O(N × B × R²) worst-case with sliding window fuzzy |
 | **Bottleneck** | File I/O (writing demultiplexed reads) |
-| **Parallelization** | Matching is parallelized, file writes are sequential |
-| **Typical Speed** | Fast, I/O bound |
+| **Parallelization** | Matching parallelized (OpenMP dynamic), writes sequential |
 
 Where:
 - **N** = number of input reads
-- **B** = number of barcodes
+- **B** = number of barcodes (× orientation variants per barcode)
 - **R** = average read length
 
 ---
@@ -267,8 +289,7 @@ Use this to cluster your reference sequences or to reduce redundancy in sequence
 |-----------|-------|---------|-------------|
 | K-mer Size | 5-31 | 15 | K-mer size for minimizer sketching |
 | Window Size | 1-50 | 10 | Window size for minimizer selection |
-| Min Shared Minimizers | 1-20 | 5 | Minimum shared minimizers for clustering |
-| Output FASTA | On/Off | Off | Generate FASTA file with cluster representatives |
+| Min Shared Minimizers | 1-20 | 3 | Minimum shared minimizers for clustering |
 
 #### Outputs
 
@@ -280,20 +301,20 @@ Use this to cluster your reference sequences or to reduce redundancy in sequence
 
 #### Methods
 
-The clustering module implements a **greedy minimizer-based clustering** approach designed for fast, approximate sequence clustering while maintaining biological accuracy.
+The clustering module implements a **greedy minimizer-based clustering** approach using the [edlib](https://github.com/Martinsos/edlib) library (v1.2.7) for sequence identity verification.
 
 **Step 1: Sequence Deduplication**
 
-Before clustering, exact duplicate sequences are removed to reduce computational load. Duplicate counts are tracked and multiplied into final cluster sizes.
+Before clustering, exact duplicate sequences are removed using an `std::unordered_map` keyed by sequence string. Duplicate counts are preserved and propagated into final cluster sizes, ensuring abundance-weighted centroid selection. Time complexity: O(N) where N = total input sequences.
 
 **Step 2: Minimizer Extraction**
 
-Minimizers are small sequence signatures used for fast similarity detection without full alignment:
+Minimizers are compact sequence signatures used for fast similarity detection without full alignment. For each unique sequence:
 
-1. For each sequence, a sliding window of size `w` moves across the sequence
-2. Within each window, the lexicographically smallest k-mer (of length `k`) is selected
-3. The set of unique minimizers forms a compact "sketch" of the sequence
-4. Sequences sharing many minimizers are likely to be similar
+1. A sliding window of size `w` (default 10) moves across the sequence from position 0 to `length - k`
+2. Within each window, the **lexicographically smallest k-mer** (of length `k`, default 15) is selected
+3. Selected minimizers are stored in an `std::unordered_set<std::string>`, automatically deduplicating
+4. The resulting set forms a compact "sketch" of the sequence
 
 ```
 Example (k=4, w=3):
@@ -302,48 +323,65 @@ Windows:  [ACGT] [CGTA] [GTAC] [TACG] [ACGT] [CGTA] [GTAC]
 Minimizers selected: {ACGT, CGTA, GTAC, TACG}
 ```
 
-**Step 3: Candidate Selection**
+Minimizer extraction is parallelized using OpenMP with dynamic scheduling (chunk size 100).
 
-For each new sequence, potential cluster matches are identified:
-1. Find all existing clusters that share minimizers with the new sequence
-2. Count shared minimizers for each candidate cluster
-3. Filter candidates by `min_shared_minimizers` threshold
-4. Sort candidates by shared minimizer count (descending)
+**Step 3: Candidate Selection via Inverted Index**
 
-This reduces comparisons from O(n²) to O(n × candidates).
+An inverted index (`std::unordered_map<string, unordered_set<size_t>>`) maps each minimizer to the set of cluster IDs containing it. For each query sequence:
 
-**Step 4: Identity Verification**
+1. Look up each of the query's minimizers in the inverted index
+2. Count shared minimizers per candidate cluster using a hash map
+3. Filter: retain only candidates with `shared_count >= min_shared_minimizers` (default 3)
+4. Sort remaining candidates by shared count in descending order (most-shared first)
 
-Top candidates are verified using edit distance (edlib library):
-1. **Length filter:** Reject if length difference makes threshold impossible
-2. **Edit distance:** Compute using edlib's fast algorithm
-3. **Identity calculation:** `identity = (max_len - edit_distance) / max_len`
-4. Accept if `identity >= identity_threshold`
+This reduces pairwise comparisons from O(n²) to O(n × c) where c is the average number of candidates per sequence.
+
+**Step 4: Identity Verification (edlib)**
+
+Top candidates are verified using the edlib library (Needleman-Wunsch global alignment, distance-only mode):
+
+1. **Length pre-filter:** Compute `max_possible_identity = 1.0 - (length_diff / max_length)`. If this is below `identity_threshold`, skip the expensive alignment entirely.
+2. **Edit distance:** Compute via `edlibAlign()` with `edlibDefaultAlignConfig()` (NW global alignment, unit costs for mismatch/indel, no traceback).
+3. **Identity calculation:**
+   ```
+   identity = (max(len₁, len₂) - edit_distance) / max(len₁, len₂)
+   ```
+4. Accept if `identity >= identity_threshold` (default 0.97)
 
 **Step 5: Greedy Assignment**
 
-- The first sequence becomes the first cluster centroid
-- Each subsequent sequence is assigned to the first matching cluster, or creates a new cluster
-- The most abundant sequence in each cluster becomes the centroid
-- A minimizer index (minimizer → cluster IDs) is maintained for fast lookups
+Sequences are processed in **input order** (not sorted by length or abundance):
+
+- The first unique sequence becomes cluster 0's centroid
+- Each subsequent sequence is compared against candidates from the inverted index
+- On first match meeting the identity threshold, the sequence joins that cluster
+- If no match is found, the sequence starts a new cluster as its centroid
+- **Centroid update rule:** If a newly assigned sequence has a higher duplicate count than the current centroid, it replaces it as the cluster representative
+- The inverted index is updated with new centroid minimizers after each assignment
 
 **Parallelization:**
 
-- Sequences are divided into batches
-- Candidate finding and identity testing run in parallel (OpenMP)
-- Cluster assignments are sequential to prevent race conditions
+- Sequences are divided into batches of size `max(100, num_sequences / (4 × num_threads))`
+- **Parallel phase:** Candidate finding and identity verification run in parallel (OpenMP, dynamic scheduling). Early match detection across threads uses `omp flush` and `omp critical` to avoid redundant alignments.
+- **Sequential phase:** Cluster assignments, centroid updates, and inverted index updates are sequential to prevent race conditions.
+
+**Output:**
+
+- `clusters.json`: Complete cluster database with centroid names, sequences, member lists, and duplicate counts
+- `centroids.fa`: FASTA file of cluster representative sequences (headers: `cluster_XXXX_<name>_size_<count>`)
+- `cluster_summary.txt`: Human-readable summary with cluster size statistics
 
 #### Performance
 
 | Aspect | Details |
 |--------|---------|
-| **Complexity** | O(U × L) after deduplication |
-| **Bottleneck** | Edit distance computation (edlib) |
-| **Parallelization** | Fully parallelized with OpenMP |
-| **Typical Speed** | Fast |
+| **Complexity** | O(U × C × L) after deduplication, where C = avg candidates |
+| **Bottleneck** | Edit distance computation (edlib global alignment) |
+| **Parallelization** | Candidate finding + identity verification parallel (OpenMP); assignment sequential |
 
 Where:
 - **U** = number of unique sequences (after removing exact duplicates)
+- **C** = average number of candidate clusters per sequence (controlled by `min_shared_minimizers`)
 - **L** = average sequence length
 
 ---
@@ -360,13 +398,13 @@ This analysis combines your clustering results with demultiplexing results to me
 |-------|-------------|
 | Cluster Result | Output from a previous Clustering job |
 | Demux Result | Output from a previous Demultiplexing job |
+| Exclude Sequences (optional) | FASTA file of sequences to filter out before diversity calculation |
 
 #### Basic Parameters
 
 | Parameter | Range | Default | Description |
 |-----------|-------|---------|-------------|
 | Identity Threshold | 0.5-1.0 | 0.95 | Identity threshold for mapping reads to clusters |
-| Min Shared Minimizers | 1-20 | 5 | Minimum shared minimizers for mapping |
 | Max Candidates | 1-100 | 10 | Maximum candidate clusters to consider per read |
 | Max Reads | 0+ | 0 (unlimited) | Limit number of reads to process (0 = all) |
 
@@ -379,6 +417,9 @@ Enable "Pre-cluster reads before mapping" to group similar reads together before
 | Parameter | Range | Default | Description |
 |-----------|-------|---------|-------------|
 | Read Cluster Identity Threshold | 0.85-1.0 | 0.95 | Similarity threshold for grouping reads |
+| Read Cluster K-mer Size | 5-31 | 11 | K-mer size for read clustering minimizers |
+| Read Cluster Window Size | 1-50 | 5 | Window size for read clustering minimizers |
+| Read Cluster Min Shared | 1-20 | 3 | Minimum shared minimizers for read clustering candidates |
 
 #### Outputs
 
@@ -398,67 +439,81 @@ For each barcode/sample:
 
 #### Methods
 
-The diversity analyzer maps reads to reference database clusters and computes ecological diversity metrics. The pipeline consists of several stages.
+The diversity analyzer maps demultiplexed reads to reference database clusters using [BLAST+](https://ftp.ncbi.nlm.nih.gov/blast/executables/blast+/2.17.0/) (v2.17.0) and computes ecological diversity metrics. The C++ core (`ngs_diversity.DiversityAnalyzer`) orchestrates the following pipeline for each barcode.
 
 **Step 1: Cluster Database Loading**
 
-The cluster database (from a previous clustering job) is loaded from JSON format:
-- Cluster centroids become the reference sequences
-- Optional filtering by `min_cluster_size` removes small clusters
-- An in-memory index enables O(1) cluster lookups
+The cluster database (from a previous clustering job) is parsed from JSON format using the [nlohmann/json](https://github.com/nlohmann/json) library (v3.11.2):
+- Cluster centroids become the reference sequences for BLAST alignment
+- Optional filtering by `min_cluster_size` removes small clusters (default: 1, include all)
+- Clusters are re-indexed contiguously (0 to N-1) for efficient O(1) vector-based lookups
 
 **Step 2: BLAST Database Creation**
 
-A BLAST database is created from cluster centroids:
-- Uses `makeblastdb` with nucleotide type
-- Hash-based sequence IDs ensure BLAST compatibility
-- Database is cached and reused across barcodes
+A BLAST nucleotide database is created from cluster centroid sequences:
+- Centroid names are hashed (`"seq_" + hex(std::hash<string>(name))`) for BLAST sequence ID compatibility
+- `makeblastdb -dbtype nucl -parse_seqids` creates the binary database
+- A reverse lookup map (hash → cluster ID) enables fast result parsing
+- The database is created once and reused across all barcodes
 
-**Step 3: Read Mapping**
+**Step 3: Exclude Sequence Filtering (Optional)**
 
-Reads are mapped to clusters using BLAST megablast:
-
-| BLAST Parameter | Value | Purpose |
-|-----------------|-------|---------|
-| Task | megablast | Optimized for long sequences |
-| Word size | 16 | Balance speed vs. sensitivity |
-| Query coverage | 60% minimum | Ensure significant overlap |
-| E-value | 1e-20 | Filter weak matches |
-| Max targets | `max_candidates` | Limit hits per read |
-
-For each read:
-1. BLAST returns candidate cluster matches
-2. Matches are filtered by `identity_threshold`
-3. Best hit (highest identity) is selected
-4. Read is assigned to that cluster
-
-Reads are processed in batches of 5,000 for efficiency.
+When an exclude sequences FASTA is provided, a separate BLAST database is built from the exclude sequences and reads are filtered before mapping:
+- Reads matching any exclude sequence at `>= identity_threshold` are removed
+- Per-exclude-sequence statistics (read count, average identity) are tracked
+- Excluded reads are counted separately and do not contribute to diversity metrics
 
 **Step 4: Read Pre-clustering (Optional)**
 
-When enabled (`cluster_reads=true`), similar reads are grouped before BLAST mapping:
-- Uses the same minimizer-based clustering algorithm
-- More permissive parameters (k=11, w=5, identity=0.85) for error tolerance
-- Cluster representatives are mapped to the database
-- Read counts are weighted by cluster size
+When enabled (`cluster_reads=true`), similar reads are grouped before BLAST mapping using the [Clustering module described above](#clustering):
+- More permissive parameters optimized for sequencing error tolerance: k=11, w=5, identity=0.85
+- Exact duplicate reads are removed first, then remaining unique reads are clustered
+- Only cluster representative sequences are submitted to BLAST
+- Read counts are weighted by cluster size in all downstream calculations
 - Reduces BLAST queries by 50-90% for redundant data
 
-**Step 5: Diversity Metric Calculation**
+**Step 5: Read Mapping via BLAST**
 
-For each barcode/sample, ecological diversity indices are computed:
+Reads (or pre-cluster representatives) are mapped to the centroid database using BLAST megablast:
+
+| BLAST Parameter | Value | Source |
+|-----------------|-------|--------|
+| Task | megablast | Optimized for high-identity nucleotide alignments |
+| Word size | 16 | `blast_utils.hpp` constant |
+| Query coverage | >= 60% | `blast_utils.hpp` constant |
+| E-value | 1e-20 | `blast_utils.hpp` constant |
+| Max target seqs | `max_candidates` (default 10) | User parameter |
+| Low-complexity filter | `-dust yes -soft_masking true` | Hardcoded |
+| Percent identity | `identity_threshold × 100` | User parameter (default 95%) |
+
+For each batch of reads (batch size = 5,000):
+1. Reads are written to a temporary FASTA query file
+2. `blastn` is executed with the parameters above and `-num_threads` set to available CPUs
+3. Tabular output (`outfmt 6`) is parsed: `qseqid sseqid pident length qlen qstart qend sstart send`
+4. Percent identity is converted to fraction (`pident / 100`)
+5. Hash-based subject IDs are resolved to cluster IDs via the reverse lookup map
+6. For reads with multiple hits, the **best hit by identity** is selected
+7. Subject coverage is calculated: `(|subject_end - subject_start| + 1) / centroid_length × 100`
+8. Strand is determined: forward if `subject_start < subject_end`, reverse otherwise
+
+Temporary query and result files are cleaned up after each batch. The `/tmp` directory uses job-specific subdirectories to prevent collisions between concurrent analyses.
+
+**Step 6: Diversity Metric Calculation**
+
+For each barcode/sample, abundance is computed from weighted read-to-cluster mappings, then ecological diversity indices are calculated from the abundance distribution:
 
 | Metric | Formula | Interpretation |
 |--------|---------|----------------|
-| **Richness (S)** | Count of unique clusters | Number of distinct sequences |
-| **Shannon Index (H')** | -Σ(pᵢ × ln(pᵢ)) | Higher = more diverse |
-| **Simpson Index (1-D)** | 1 - Σ(pᵢ²) | Probability two reads differ |
-| **Pielou's Evenness (J')** | H' / ln(S) | How evenly distributed (0-1) |
+| **Richness (S)** | Count of unique clusters with ≥ 1 mapped read | Number of distinct sequence types |
+| **Shannon Index (H')** | −Σ(pᵢ × ln(pᵢ)) | Higher = more diverse; uses natural logarithm |
+| **Simpson Index (1-D)** | 1 − Σ(pᵢ²) | Probability two randomly selected reads are from different clusters |
+| **Pielou's Evenness (J')** | H' / ln(S) | How evenly reads are distributed (0–1); returns 0 when S ≤ 1 |
 
-Where pᵢ = (reads in cluster i) / (total reads)
+Where **pᵢ = (weighted reads in cluster i) / (total mapped reads)**. Unmapped reads are excluded from diversity calculations. When read pre-clustering is enabled, all counts use the weighted values (cluster size × representative count). NaN and infinity safety checks are applied to all computed indices.
 
 **Example Calculation:**
 ```
-Sample with 100 reads across 3 clusters: [50, 30, 20]
+Sample with 100 mapped reads across 3 clusters: [50, 30, 20]
 p = [0.5, 0.3, 0.2]
 
 Richness = 3
@@ -467,17 +522,25 @@ Simpson  = 1 - (0.5² + 0.3² + 0.2²) = 0.62
 Evenness = 1.03 / ln(3) = 0.94
 ```
 
+**Step 7: Per-Barcode Output**
+
+For each barcode, the analyzer writes:
+- `{barcode}_abundance.tsv`: Cluster-level abundance table sorted by read count (columns: Cluster_ID, Centroid_Name, Read_Count, Percent_Total, Avg_Identity, Avg_Read_Length, Centroid_Length, Avg_Read_Coverage_Pct)
+- `{barcode}_excluded_abundance.tsv` (if exclude sequences used): Per-exclude-sequence statistics
+- `diversity_metrics.tsv`: Global metrics table across all barcodes
+- `diversity_summary.txt`: Human-readable summary with per-barcode breakdown and top clusters
+
 #### Performance
 
 | Aspect | Details |
 |--------|---------|
 | **Complexity** | O(N × log(K) × L) |
 | **Bottleneck** | BLAST alignment |
-| **Parallelization** | BLAST internal parallelization |
+| **Parallelization** | BLAST internal threading (`-num_threads`); barcodes processed sequentially |
 | **Typical Speed** | Slowest of the three job types |
 
 Where:
-- **N** = number of reads to map (across all barcodes)
+- **N** = number of reads to map (across all barcodes; reduced by pre-clustering)
 - **K** = number of clusters in the reference database
 - **L** = average sequence length
 
@@ -603,7 +666,7 @@ Here's a typical end-to-end analysis workflow:
 
 | Issue | Possible Cause | Solution |
 |-------|---------------|----------|
-| Low barcode assignment rate | Barcodes not matching | Check barcode sequences, try reverse complement, increase max errors |
+| Low barcode assignment rate | Barcodes not matching | Check barcode sequences, ensure reverse complements are in FASTA, increase max errors |
 | Job fails immediately | Invalid file format | Verify file is correctly formatted FASTQ/FASTA |
 | Very slow processing | Large file size | Use Max Reads to limit processing, or wait for completion |
 | No diversity results | No reads mapped | Check identity threshold, ensure reference matches your samples |
