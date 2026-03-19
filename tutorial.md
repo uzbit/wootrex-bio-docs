@@ -182,8 +182,9 @@ This is typically the first step when processing multiplexed sequencing data.
 
 | Parameter | Range | Default | Description |
 |-----------|-------|---------|-------------|
-| Minimum Quality Score | 0-50 | 18.0 | Minimum average quality score for a read to be processed |
-| Maximum Errors | 0+ | 0 | Maximum number of errors allowed when matching barcodes |
+| Minimum Quality Score | 0-50 | 18.0 | Minimum average quality score for a read to pass quality filtering |
+| Maximum Errors | 0+ | 0 | Maximum edit distance (insertions, deletions, substitutions) allowed per barcode match. Set to 0 for exact matching only |
+| Require Barcode Match at Both Ends | on/off | off | When enabled, the same barcode must be found at both the start and end of each read. Automatically sets max errors to 5. See [Barcode Matching Algorithm](#barcode-matching-algorithm) for details |
 
 #### Outputs
 
@@ -195,27 +196,25 @@ This is typically the first step when processing multiplexed sequencing data.
 
 #### Methods
 
-The demultiplexer assigns reads to sample barcodes using a two-stage approximate matching strategy implemented in C++.
+The demultiplexer assigns reads to sample barcodes using [edlib](https://github.com/Martinsos/edlib) semi-global alignment (edit distance), implemented in C++. The algorithm is modeled after [dorado](https://github.com/nanoporetech/dorado)'s fuzzy barcode matching.
 
 **Step 1: Barcode Loading and Grouping**
 
 Barcodes are loaded from a FASTA file and grouped by normalized name. Orientation suffixes (`_FWD`, `_REV`, `_REVCOMP`, case-insensitive) are stripped so that all orientation variants of a barcode are searched together. Reverse complements are **not** computed at runtime — they must be provided as separate entries in the barcode FASTA file. All barcode sequences are uppercased on load.
 
-**Step 2: Barcode Matching**
+**Step 2: Barcode Matching Algorithm**
 
-For each read, the sequence is uppercased and tested against every barcode group. Matching proceeds in two stages:
+For each read, every barcode is scored by aligning all of its sequence variants (forward, reverse complement) against the **full read** using edlib in semi-global mode (`EDLIB_MODE_HW`). This mode finds the best location for the barcode anywhere within the read, allowing insertions, deletions, and substitutions. No windowing or edit-distance cutoff is applied to edlib — it always returns the globally optimal alignment.
 
-1. **Exact Substring Search (fast path):** `std::string::find()` searches for the barcode anywhere within the read. On the first exact match found, the read is immediately assigned to that barcode.
+For each barcode, the forward variant typically aligns near the start of the read and the reverse complement near the end. The **top penalty** is the edit distance of the best-matching variant, and the **bottom penalty** is the other variant's edit distance.
 
-2. **Hamming Distance Matching (when `max_errors > 0`):** If no exact match is found and fuzzy matching is enabled, Hamming distance is computed at specific read positions:
-   - **Position 0** (read start) — tested first, as barcodes most commonly appear here
-   - **Position `read_length - barcode_length`** (read end) — tested second
-   - **Sliding window across all positions** — tested only when `max_errors >= 2`
-   - A match is accepted if `Hamming distance <= max_errors`
+**Scoring and classification** depend on the mode:
 
-The Hamming distance function compares characters without early termination, yielding O(B) per position where B is barcode length.
+- **Default mode** (`barcode_both_ends = off`): The barcode's score is the minimum edit distance across all variants. The read is classified to the barcode with the lowest score, provided it is within `max_errors`.
 
-**Ambiguous match handling:** The first matching barcode in iteration order is returned. No confidence scoring or best-match selection is performed. Reads matching no barcode are classified as "unclassified."
+- **Both-ends mode** (`barcode_both_ends = on`): Both the forward and reverse complement variants must produce valid alignments. The barcode's score is the **sum** of the top and bottom penalties (combined edit distance). The read is classified to the barcode with the lowest combined score, provided the combined score ≤ `2 × max_errors`.
+
+**Ambiguity filtering:** After selecting the best barcode, the gap between the best and second-best barcode scores is checked. If the gap is less than 3 edit distances (`min_barcode_penalty_dist = 3`), the read is classified as "unclassified" to avoid ambiguous assignments. This prevents mis-classification when two barcodes score similarly.
 
 **Step 3: Quality Filtering**
 
@@ -227,7 +226,15 @@ Q_avg = (1/n) × Σᵢ (ASCII(qᵢ) - 33)
 
 Where 33 is the PHRED33 offset (Illumina 1.8+, Nanopore standard). Reads with `Q_avg >= min_quality` (default 18.0) are classified as "pass"; all others as "fail." Both categories are written to separate output subdirectories, preserving the full original read and quality string without trimming.
 
-**Step 4: Output**
+**Step 4: Barcode Info Output**
+
+A per-read diagnostic TSV (`barcode_info.tsv`) is always generated, containing for every read:
+- Classification result and edit distances for each variant at each end
+- Normalized alignment positions, combined penalty, penalty gap, and barcode score (0–1)
+
+This file is used to generate QC plots (barcode overview, edit distance distributions, penalty analysis, position analysis) that are included in the result archive.
+
+**Step 5: Output**
 
 Demultiplexed reads are organized into a directory hierarchy:
 ```
@@ -238,7 +245,13 @@ output_dir/
 │            /fail/reads.fastq
 ├── unclassified/pass/reads.fastq
 │               /fail/reads.fastq
-└── demux_summary.txt
+├── barcode_info.tsv
+├── barcode_overview.png
+├── barcode_edit_distances.png
+├── barcode_penalties.png
+├── barcode_positions.png
+├── demux_summary.txt
+└── params.txt
 ```
 
 Barcode directory names are normalized (e.g., `NB01` → `barcode01`). Output file handles are lazily created and cached to avoid repeated file opens.
@@ -254,14 +267,14 @@ Barcode directory names are normalized (e.g., `NB01` → `barcode01`). Output fi
 
 | Aspect | Details |
 |--------|---------|
-| **Complexity** | O(N × B × R) per exact match; O(N × B × R²) worst-case with sliding window fuzzy |
-| **Bottleneck** | File I/O (writing demultiplexed reads) |
+| **Complexity** | O(N × B × L) where each barcode variant is aligned against the full read |
+| **Bottleneck** | edlib alignment (mitigated by OpenMP parallelization) |
 | **Parallelization** | Matching parallelized (OpenMP dynamic), writes sequential |
 
 Where:
 - **N** = number of input reads
 - **B** = number of barcodes (× orientation variants per barcode)
-- **R** = average read length
+- **L** = average read length
 
 ---
 
@@ -650,7 +663,8 @@ Here's a typical end-to-end analysis workflow:
 ### Parameter Tuning
 
 **For Demultiplexing:**
-- Increase Max Errors (1-2) if your barcode assignment rate is low
+- Enable "Require barcode match at both ends" for double-ended barcode kits (e.g., ONT SQK-NBD114-96) — this sets max errors to 5 and requires the same barcode at both read ends
+- If assignment rate is low without both-ends mode, increase Max Errors to 1-2 for fuzzy matching
 - Adjust Minimum Quality Score based on your sequencing platform
 
 **For Clustering:**
@@ -666,7 +680,7 @@ Here's a typical end-to-end analysis workflow:
 
 | Issue | Possible Cause | Solution |
 |-------|---------------|----------|
-| Low barcode assignment rate | Barcodes not matching | Check barcode sequences, ensure reverse complements are in FASTA, increase max errors |
+| Low barcode assignment rate | Barcodes not matching | Check barcode sequences, ensure reverse complements are in FASTA, enable both-ends mode, or increase max errors |
 | Job fails immediately | Invalid file format | Verify file is correctly formatted FASTQ/FASTA |
 | Very slow processing | Large file size | Use Max Reads to limit processing, or wait for completion |
 | No diversity results | No reads mapped | Check identity threshold, ensure reference matches your samples |
