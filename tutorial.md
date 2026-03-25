@@ -183,8 +183,8 @@ This is typically the first step when processing multiplexed sequencing data.
 | Parameter | Range | Default | Description |
 |-----------|-------|---------|-------------|
 | Minimum Quality Score | 0-50 | 18.0 | Minimum average quality score for a read to pass quality filtering |
-| Maximum Errors | 0+ | 0 | Maximum edit distance (insertions, deletions, substitutions) allowed per barcode match. Set to 0 for exact matching only |
-| Require Barcode Match at Both Ends | on/off | off | When enabled, the same barcode must be found at both the start and end of each read. Automatically sets max errors to 5. See [Barcode Matching Algorithm](#barcode-matching-algorithm) for details |
+| Maximum Errors | 0+ | 10 | Sum of total errors (indels + snps) in forward and reverse barcodes if matching both ends, or maximum errors for the best end if not both ends required |
+| Require Barcode Match at Both Ends | on/off | on | When enabled, the same barcode must be found at both the start and end of each read. Automatically sets max errors to 10. See [Barcode Matching Algorithm](#barcode-matching-algorithm) for details |
 
 #### Outputs
 
@@ -204,15 +204,28 @@ Barcodes are loaded from a FASTA file and grouped by normalized name. Orientatio
 
 **Step 2: Barcode Matching Algorithm**
 
+**How ONT native barcodes work:** During library prep (e.g., SQK-NBD114-96), a barcode adapter ligates to both ends of each DNA fragment. Each barcode has one canonical 24bp sequence. Because DNA is double-stranded, when the nanopore reads one strand 5'→3':
+
+```
+5'─[flank]─[BARCODE_FWD]─[flank]─── insert DNA ───[flank]─[BARCODE_REVCOMP]─[flank]─3'
+   (start of read)                                                    (end of read)
+```
+
+- The **forward barcode** appears near the **start** of the read
+- The **reverse complement** of the same barcode appears near the **end** of the read
+- This is a single barcode, double-ended kit — both ends carry the same barcode (one in each orientation)
+
+The barcode FASTA provides both orientations explicitly (e.g., `NB01_FWD` and `NB01_REV`), which are grouped under a single barcode name during loading.
+
 For each read, every barcode is scored by aligning all of its sequence variants (forward, reverse complement) against the **full read** using edlib in semi-global mode (`EDLIB_MODE_HW`). This mode finds the best location for the barcode anywhere within the read, allowing insertions, deletions, and substitutions. No windowing or edit-distance cutoff is applied to edlib — it always returns the globally optimal alignment.
 
-For each barcode, the forward variant typically aligns near the start of the read and the reverse complement near the end. The **top penalty** is the edit distance of the best-matching variant, and the **bottom penalty** is the other variant's edit distance.
+For each barcode, the forward variant typically aligns near the start of the read and the reverse complement near the end. The **top penalty** (better end's edit distance) is the lower ED of the two orientations, and the **bottom penalty** (worse end's edit distance) is the higher ED.
 
 **Scoring and classification** depend on the mode:
 
 - **Default mode** (`barcode_both_ends = off`): The barcode's score is the minimum edit distance across all variants. The read is classified to the barcode with the lowest score, provided it is within `max_errors`.
 
-- **Both-ends mode** (`barcode_both_ends = on`): Both the forward and reverse complement variants must produce valid alignments. The barcode's score is the **sum** of the top and bottom penalties (combined edit distance). The read is classified to the barcode with the lowest combined score, provided the combined score ≤ `2 × max_errors`.
+- **Both-ends mode** (`barcode_both_ends = on`): Both the forward and reverse complement variants must produce valid alignments. The barcode's score is the **sum** of the top and bottom penalties (combined edit distance). The read is classified to the barcode with the lowest combined score, provided the combined score ≤ `max_errors`.
 
 **Ambiguity filtering:** After selecting the best barcode, the gap between the best and second-best barcode scores is checked. If the gap is less than 3 edit distances (`min_barcode_penalty_dist = 3`), the read is classified as "unclassified" to avoid ambiguous assignments. This prevents mis-classification when two barcodes score similarly.
 
@@ -232,7 +245,7 @@ A per-read diagnostic TSV (`barcode_info.tsv`) is always generated, containing f
 - Classification result and edit distances for each variant at each end
 - Normalized alignment positions, combined penalty, penalty gap, and barcode score (0–1)
 
-This file is used to generate QC plots (barcode overview, edit distance distributions, penalty analysis, position analysis) that are included in the result archive.
+This file is used to generate QC plots (barcode overview, edit distance distributions, position analysis) that are included in the result archive.
 
 **Step 5: Output**
 
@@ -248,7 +261,6 @@ output_dir/
 ├── barcode_info.tsv
 ├── barcode_overview.png
 ├── barcode_edit_distances.png
-├── barcode_penalties.png
 ├── barcode_positions.png
 ├── demux_summary.txt
 └── params.txt
@@ -663,7 +675,7 @@ Here's a typical end-to-end analysis workflow:
 ### Parameter Tuning
 
 **For Demultiplexing:**
-- Enable "Require barcode match at both ends" for double-ended barcode kits (e.g., ONT SQK-NBD114-96) — this sets max errors to 5 and requires the same barcode at both read ends
+- Enable "Require barcode match at both ends" for double-ended barcode kits (e.g., ONT SQK-NBD114-96) — this sets max errors to 10 and requires the forward barcode near the read start and its reverse complement near the read end
 - If assignment rate is low without both-ends mode, increase Max Errors to 1-2 for fuzzy matching
 - Adjust Minimum Quality Score based on your sequencing platform
 
