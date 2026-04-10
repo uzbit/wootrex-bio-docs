@@ -494,32 +494,48 @@ When enabled (`cluster_reads=true`), similar reads are grouped before BLAST mapp
 - More permissive parameters optimized for sequencing error tolerance: k=11, w=5, identity=0.85
 - Exact duplicate reads are removed first, then remaining unique reads are clustered
 - Only cluster representative sequences are submitted to BLAST
-- Read counts are weighted by cluster size in all downstream calculations
+- Read counts are weighted by cluster size in **abundance counts and diversity indices** (see callout below)
 - Reduces BLAST queries by 50-90% for redundant data
+
+> **What is and isn't weighted by pre-cluster size**
+>
+> When `cluster_reads=true`, pre-cluster sizes (which already include exact-dedup counts) are propagated through `ReadMapping.weight` and consumed by `AbundanceCalculator`. The resulting numbers split into two groups:
+>
+> **Weighted (reflects original input read count):**
+> - `Read_Count`, `Percent_Total` per cluster
+> - `total_reads`, `mapped_reads`, `unmapped_reads`
+> - Shannon, Simpson, Evenness, Richness — all driven by the weighted per-cluster counts
+>
+> **NOT weighted (computed over representatives only):**
+> - `Avg_Identity`, `Avg_Read_Length`, `Avg_Read_Coverage_Pct`
+>
+> The "avg" columns are unweighted means over the cluster *representatives*, not the original reads. If a cluster represents 5,000 reads pre-clustered down to 100 representatives, `Avg_Identity` is the mean of 100 identity values, not 5,000. The reads collapsed into each representative contribute zero information to these averages — this is by design, since collapsed reads are never individually BLAST-aligned and so per-read identity simply doesn't exist for them.
 
 **Step 5: Read Mapping via BLAST**
 
-Reads (or pre-cluster representatives) are mapped to the centroid database using BLAST megablast:
+Reads (or pre-cluster representatives) are mapped to the centroid database using BLAST megablast as a candidate prefilter, followed by an edlib global verification step that picks the final cluster assignment:
 
 | BLAST Parameter | Value | Source |
 |-----------------|-------|--------|
 | Task | megablast | Optimized for high-identity nucleotide alignments |
 | Word size | 16 | `blast_utils.hpp` constant |
-| Query coverage | >= 60% | `blast_utils.hpp` constant |
+| Query coverage | `min_read_coverage` (default 60) | User parameter — minimum % of the read that must align to a centroid for the hit to be considered |
 | E-value | 1e-20 | `blast_utils.hpp` constant |
 | Max target seqs | `max_candidates` (default 10) | User parameter |
 | Low-complexity filter | `-dust yes -soft_masking true` | Hardcoded |
 | Percent identity | `identity_threshold × 100` | User parameter (default 95%) |
 
-For each batch of reads (batch size = 5,000):
+For each batch of reads (batch size = 2,500):
 1. Reads are written to a temporary FASTA query file
 2. `blastn` is executed with the parameters above and `-num_threads` set to available CPUs
 3. Tabular output (`outfmt 6`) is parsed: `qseqid sseqid pident length qlen qstart qend sstart send`
-4. Percent identity is converted to fraction (`pident / 100`)
-5. Hash-based subject IDs are resolved to cluster IDs via the reverse lookup map
-6. For reads with multiple hits, the **best hit by identity** is selected
-7. Subject coverage is calculated: `(|subject_end - subject_start| + 1) / centroid_length × 100`
-8. Strand is determined: forward if `subject_start < subject_end`, reverse otherwise
+4. Hash-based subject IDs are resolved to cluster IDs via the reverse lookup map
+5. **Group HSPs by cluster.** A single read can match multiple HSPs against the same centroid; for each candidate cluster the highest-pident HSP is kept (used only for strand and subject coverage — edlib does its own global alignment from scratch).
+6. **Edlib HW global verification.** For each unique candidate cluster, the read is aligned to the centroid using edlib in semi-global (HW) mode (`EDLIB_MODE_HW`, `EDLIB_TASK_DISTANCE`). The shorter of `(read, centroid)` is the query, the longer is the target. If the candidate's best HSP was on the reverse strand, the read is reverse-complemented before alignment. Identity is computed as `1 - editDistance / query.size()`.
+7. **Pick the winner by edlib identity, not megablast pident.** Candidates are sorted descending by edlib identity, tie-broken by lowest `cluster_id` for reproducibility. The winner becomes the read's assigned cluster. This is critical for strain-level work: megablast pident is local and noisy, so two near-identical centroids can return the same pident even when global identity clearly favors one. The edlib re-pick gives a globally meaningful score and prevents the cluster choice from being driven by BLAST hit ordering.
+8. **Identity gap to second-best.** `ReadMapping.identity_gap_to_second` records `winner_identity − runner_up_identity`. If only one candidate cluster exists, the gap is set to 1.0 (the "no rival" sentinel). Small positive values (e.g. < 0.005) flag reads where two or more centroids are near-tied, which is the strain-level ambiguity signal that downstream consumers can use to drop, downweight, or report ambiguous reads separately.
+9. Subject coverage is calculated from the winner's best HSP: `(|subject_end - subject_start| + 1) / centroid_length × 100`
+10. Strand is determined from the winner's best HSP: forward if `subject_start < subject_end`, reverse otherwise
 
 Temporary query and result files are cleaned up after each batch. The `/tmp` directory uses job-specific subdirectories to prevent collisions between concurrent analyses.
 
@@ -550,7 +566,7 @@ Evenness = 1.03 / ln(3) = 0.94
 **Step 7: Per-Barcode Output**
 
 For each barcode, the analyzer writes:
-- `{barcode}_abundance.tsv`: Cluster-level abundance table sorted by read count (columns: Cluster_ID, Centroid_Name, Read_Count, Percent_Total, Avg_Identity, Avg_Read_Length, Centroid_Length, Avg_Read_Coverage_Pct)
+- `{barcode}_abundance.tsv`: Cluster-level abundance table sorted by read count. Columns: `Cluster_ID`, `Centroid_Name`, `Read_Count` (weighted by pre-cluster size when `cluster_reads=true`), `Percent_Total` (weighted), `Avg_Identity` (unweighted; mean over representatives only when `cluster_reads=true`), `Avg_Read_Length` (unweighted), `Centroid_Length`, `Avg_Read_Coverage_Pct` (unweighted)
 - `{barcode}_excluded_abundance.tsv` (if exclude sequences used): Per-exclude-sequence statistics
 - `diversity_metrics.tsv`: Global metrics table across all barcodes
 - `diversity_summary.txt`: Human-readable summary with per-barcode breakdown and top clusters
