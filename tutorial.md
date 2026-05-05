@@ -294,7 +294,7 @@ Where:
 
 **Purpose**: Group similar sequences together based on sequence identity.
 
-Use this to cluster your reference sequences or to reduce redundancy in sequence databases.
+Use this to cluster your reference sequences (curated FASTA databases — dedupe redundant entries, build a reference DB for downstream Diversity Analysis), **or** to cluster FASTQ reads directly (dedupe redundant reads from the same source DNA, e.g. nanopore amplicon data — output is a `Clustered Reads` archive that downstream Diversity Analysis can consume for weighted mapping).
 
 #### Required Inputs
 
@@ -409,12 +409,12 @@ The clusterer has two knobs that together control how aggressively it merges:
 
 Both must let a pair through for it to merge. Most users only ever need to touch `identity_threshold`; `minimizer_match_ratio` only matters when you push identity below ~0.80, which is rare.
 
-The recommendations below come from running `python/sweep_taxonomy_clusterer.py` against a stratified real-NCBI 16S fixture: **10 genera × 10 species/genus × 10 strains/species = 1,000 full-length 16S references** pulled from NCBI's broad nuccore 16S pool. The two supporting plots — one for default prefilter (`ratio=0.25`) and one for loose prefilter (`ratio=0.05`) — appear inline in the relevant tiers below.
+The recommendations below come from running `python/sweep_taxonomy_clusterer.py` against a stratified real-NCBI 16S fixture: **10 genera × 10 species/genus × 10 strains/species = 1,000 full-length 16S references** pulled from NCBI's broad nuccore 16S pool.
 
-Each plot shows three stacked panels: **Homogeneity** ("are the predicted clusters pure at this taxonomic level?" — drops on over-merging), **Completeness** ("do all members of one taxon land in the same cluster?" — drops on over-fragmentation), and **# clusters produced**, all as a function of `identity_threshold`. Three curves per panel: genus / species / strain.
+The plot has three stacked panels: **Homogeneity** ("are the predicted clusters pure at this taxonomic level?" — drops on over-merging), **Completeness** ("do all members of one taxon land in the same cluster?" — drops on over-fragmentation), and **# clusters produced**, all as a function of `identity_threshold`. Three curves per panel: genus / species / strain.
 
 ![Resolution dial — default prefilter (k=15, w=10, ratio=0.25)](images/cluster_dial_default_prefilter.png)
-*Default-prefilter sweep on 1,000 real NCBI 16S refs. The strain-level dial works (red curve in the homogeneity panel rises with identity, completeness pinned near 1.0). Species-level partial. Genus completeness floors out around 0.55–0.60 because cross-genus pairs never enter the candidate pool at these identity values.*
+*Sweep on 1,000 real NCBI 16S refs at default parameters. The strain-level dial works (homogeneity rises with identity, completeness pinned near 1.0). Species-level is partial. Genus completeness floors around 0.55–0.60 because cross-genus pairs never enter the candidate pool at id ≥ 0.80. Loosening `minimizer_match_ratio` toward 0.05 produces a near-identical plot in this id range — the alignment gate is what's binding, not the prefilter.*
 
 **Tier 1 — Strain-level dedup (the production case)**
 
@@ -440,15 +440,11 @@ Lower `identity_threshold` to **0.85–0.90**, leave `minimizer_match_ratio = 0.
 
 **Tier 3 — Coarser than species (genus-level grouping)**
 
-The clusterer **does not produce a clean genus partition** at any combination of `identity_threshold` and `minimizer_match_ratio` we've tested. The loose-prefilter sweep below shows what's actually achievable:
+The clusterer **does not produce a clean genus partition** at any combination of `identity_threshold` and `minimizer_match_ratio` we've tested. Going below id=0.85 (the right edge of the plot above is 0.75) gets into a regime that *is* visible in the chart — H(genus) starts dropping from 1.0 — but the underlying behavior on the same 1,000-ref fixture is:
 
-![Resolution dial — loose prefilter (k=15, w=10, ratio=0.05)](images/cluster_dial_loose_prefilter.png)
-*Loose-prefilter sweep on the same 1,000 refs. Identical to the default-prefilter plot for id ≥ 0.80 — the alignment gate dominates. Below id=0.75 the partition collapses to 2–4 mega-clusters that mix all genera indiscriminately (homogeneity ≈ 0.02): the "cliff" described below.*
-
-Specific findings:
-
-- At `identity_threshold = 0.75` and `minimizer_match_ratio = 0.05`: **40 clusters**, H(genus)=0.634, C(genus)=0.619. The best partial-genus result on the sweep, but H(genus)=0.63 means cross-genus merges are already happening (about a third of cluster mass comes from outside the dominant genus). C(genus)=0.62 means each genus is still split across multiple clusters.
-- At `identity_threshold ≤ 0.70` (any prefilter): **the partition collapses to 2–4 mega-clusters covering the whole input** (e.g., 4 clusters total at id=0.70, 2 clusters at id=0.50). H(genus) crashes to **0.02** — those mega-clusters mix all genera indiscriminately. There is no monotonic descent into a clean genus partition; the transition from "partial genus mode" (id=0.75) to "everything merges" (id=0.70) is a cliff.
+- At `identity_threshold = 0.75` (default prefilter): 64 clusters, H(genus)=0.77, C(genus)=0.60.
+- At `identity_threshold = 0.75` with **loose prefilter (`ratio=0.05`)**: 40 clusters, H(genus)=0.63, C(genus)=0.62. The best partial-genus result on any sweep we ran, but H(genus)=0.63 means about a third of cluster mass comes from outside the dominant genus.
+- At `identity_threshold ≤ 0.70` (any prefilter): **the partition collapses to 2–4 mega-clusters covering the whole input** — e.g. 4 clusters total at id=0.70, 2 clusters at id=0.50. H(genus) crashes to **0.02**: those mega-clusters mix all genera indiscriminately. There is no monotonic descent into a clean genus partition; the transition from "partial genus mode" (id=0.75) to "everything merges" (id=0.70) is a cliff.
 
 The mechanism: at id ≥ 0.80 the alignment gate itself blocks cross-genus pairs (real cross-genus 16S identity is ~75–85%), so loosening the prefilter doesn't help — both prefilter settings produce identical partitions at id ≥ 0.80. Below id=0.75 the alignment gate starts admitting cross-genus pairs, but it admits them indiscriminately because the underlying 16S signal at that level is too noisy for the greedy-minimizer design to discriminate genera apart.
 
