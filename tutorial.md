@@ -300,13 +300,14 @@ Use this to cluster your reference sequences or to reduce redundancy in sequence
 
 | Input | Description |
 |-------|-------------|
-| Input Reference FASTA | FASTA file containing sequences to cluster |
+| Input FASTA or FASTQ File | Sequences to cluster. FASTA inputs (target/other reference sequences) are clustered as-is. FASTQ inputs (Nanopore, Illumina, PacBio, generic) are quality-filtered, converted to FASTA, then clustered with `strand_aware=true` so reverse-complement reads collapse into the same cluster as their forward strand. FASTQ runs additionally produce a `Clustered Reads` archive that can be passed directly to a downstream Diversity Analysis job for weighted mapping. |
 
 #### Basic Parameters
 
 | Parameter | Range | Default | Description |
 |-----------|-------|---------|-------------|
 | Identity Threshold | 0.5-1.0 | 0.97 | Minimum sequence identity to cluster sequences together |
+| Min Read Quality (FASTQ only) | 0-50 | 18 | Average Phred quality below which a read is dropped before clustering. Set to 0 to disable. Ignored for FASTA input. |
 
 #### Advanced Parameters
 
@@ -314,15 +315,17 @@ Use this to cluster your reference sequences or to reduce redundancy in sequence
 |-----------|-------|---------|-------------|
 | K-mer Size | 5-31 | 15 | K-mer size for minimizer sketching |
 | Window Size | 1-50 | 10 | Window size for minimizer selection |
-| Min Shared Minimizers | 1-20 | 3 | Minimum shared minimizers for clustering |
+| Minimizer Match Ratio | 0.0-1.0 | 0.25 | Fraction of the query's minimizers a candidate centroid must share before alignment is attempted. The per-query threshold is computed dynamically as `max(1, ratio × query_minimizers)`, so longer sequences automatically get a higher bar (faster filtering) while short reads aren't over-filtered. Higher = faster, possibly missing weak matches; lower = more thorough, slower. |
 
 #### Outputs
 
 - **Number of Clusters**: Total clusters created
-- **Total Sequences**: Input sequence count
+- **Total Sequences**: Input sequence count (after FASTQ quality filtering, when applicable)
 - **Unique Sequences**: Sequences after clustering
 - **Compression Ratio**: Reduction achieved by clustering
-- **Downloadable files**: Cluster archive (ZIP)
+- **Downloadable files**:
+  - **Cluster Database archive (ZIP)** — always produced. Contains `clusters.json` (centroid sequences, member lists with `member_ids`, duplicate counts), `centroids.fa`, `cluster_summary.txt`, and `params.txt`.
+  - **Clustered Reads archive (ZIP)** — produced only for FASTQ input. Bundles the cluster database alongside per-read information so a downstream Diversity Analysis job can weight reads by upstream cluster size.
 
 #### Methods
 
@@ -356,7 +359,7 @@ An inverted index (`std::unordered_map<string, unordered_set<size_t>>`) maps eac
 
 1. Look up each of the query's minimizers in the inverted index
 2. Count shared minimizers per candidate cluster using a hash map
-3. Filter: retain only candidates with `shared_count >= min_shared_minimizers` (default 3)
+3. Filter using a **per-query dynamic threshold**: `dynamic_msm = max(1, minimizer_match_ratio × |query_minimizers|)` (default ratio 0.25). A candidate must share at least this many minimizers with the query to survive. Because the bar scales with query length, short reads aren't over-filtered (the floor of 1 still admits low-minimizer reads), while long sequences automatically get a stricter cutoff that prunes most of the candidate pool before alignment.
 4. Sort remaining candidates by shared count in descending order (most-shared first)
 
 This reduces pairwise comparisons from O(n²) to O(n × c) where c is the average number of candidates per sequence.
@@ -392,9 +395,68 @@ Sequences are processed in **input order** (not sorted by length or abundance):
 
 **Output:**
 
-- `clusters.json`: Complete cluster database with centroid names, sequences, member lists, and duplicate counts
+- `clusters.json`: Complete cluster database with centroid names, sequences, member lists (including `member_ids` to round-trip back to original input names), and duplicate counts
 - `centroids.fa`: FASTA file of cluster representative sequences (headers: `cluster_XXXX_<name>_size_<count>`)
-- `cluster_summary.txt`: Human-readable summary with cluster size statistics
+- `cluster_summary.txt`: Human-readable summary with cluster size statistics. For FASTQ input, the summary also includes a **FASTQ Quality Filter** block reporting reads kept / dropped and the active `min_quality` threshold.
+- `params.txt`: Exact parameters used (identity threshold, k, w, minimizer_match_ratio, strand_aware, ...).
+
+#### Choosing parameters by target resolution
+
+The clusterer has two knobs that together control how aggressively it merges:
+
+- `identity_threshold` — minimum sequence identity for two inputs to share a cluster (the **alignment gate**).
+- `minimizer_match_ratio` — fraction of the query's minimizers a candidate must share before alignment runs (the **prefilter**).
+
+Both must let a pair through for it to merge. Most users only ever need to touch `identity_threshold`; `minimizer_match_ratio` only matters when you push identity below ~0.80, which is rare.
+
+The recommendations below come from running `python/sweep_taxonomy_clusterer.py` against a stratified real-NCBI 16S fixture: **10 genera × 10 species/genus × 10 strains/species = 1,000 full-length 16S references** pulled from NCBI's broad nuccore 16S pool. The two supporting plots — one for default prefilter (`ratio=0.25`) and one for loose prefilter (`ratio=0.05`) — appear inline in the relevant tiers below.
+
+Each plot shows three stacked panels: **Homogeneity** ("are the predicted clusters pure at this taxonomic level?" — drops on over-merging), **Completeness** ("do all members of one taxon land in the same cluster?" — drops on over-fragmentation), and **# clusters produced**, all as a function of `identity_threshold`. Three curves per panel: genus / species / strain.
+
+![Resolution dial — default prefilter (k=15, w=10, ratio=0.25)](images/cluster_dial_default_prefilter.png)
+*Default-prefilter sweep on 1,000 real NCBI 16S refs. The strain-level dial works (red curve in the homogeneity panel rises with identity, completeness pinned near 1.0). Species-level partial. Genus completeness floors out around 0.55–0.60 because cross-genus pairs never enter the candidate pool at these identity values.*
+
+**Tier 1 — Strain-level dedup (the production case)**
+
+Use `identity_threshold = 0.97`, `minimizer_match_ratio = 0.25` (both defaults). On 1,000 real refs:
+
+| Metric | Genus | Species | Strain |
+|--------|------:|--------:|-------:|
+| Homogeneity | 1.000 | 0.899 | 0.802 |
+| Completeness | 0.416 | 0.747 | **0.998** |
+
+Reading: **378 clusters out of 992 distinct strain truth labels.** Strain completeness is ~1.0 (every strain's refs land together), homogeneity is high enough that clusters don't mix strains across species lines (H(species)=0.90 means 90% of cluster mass comes from a single species). The partition is finer than strain (some near-identical strains do split apart at 97% identity), which is exactly the right behavior for "preserve every distinct sequence in a curated reference DB." Don't change this for the typical workflow.
+
+**Tier 2 — Species-level grouping (collapse strains within a species)**
+
+Lower `identity_threshold` to **0.85–0.90**, leave `minimizer_match_ratio = 0.25`. On 1,000 real refs at id=0.85:
+
+| Metric | Genus | Species | Strain |
+|--------|------:|--------:|-------:|
+| Homogeneity | 0.997 | 0.738 | 0.578 |
+| Completeness | 0.576 | 0.853 | 0.999 |
+
+100 clusters total. Species-completeness rises to 0.85 (most species do land in a single cluster); H(species)=0.74 because some species pairs at the lower end of intra-species 16S divergence merge with each other. Strain still preserved (C=1.0) but no longer the dominant grouping (H drops). This is "good enough" species-mostly-pure clustering, useful when you want to collapse near-redundant strains but keep distinct species apart. Below 0.85 with default prefilter the result barely changes — at id=0.80 you get 68 clusters and H(genus)=0.88, but cross-species merges have already started.
+
+**Tier 3 — Coarser than species (genus-level grouping)**
+
+The clusterer **does not produce a clean genus partition** at any combination of `identity_threshold` and `minimizer_match_ratio` we've tested. The loose-prefilter sweep below shows what's actually achievable:
+
+![Resolution dial — loose prefilter (k=15, w=10, ratio=0.05)](images/cluster_dial_loose_prefilter.png)
+*Loose-prefilter sweep on the same 1,000 refs. Identical to the default-prefilter plot for id ≥ 0.80 — the alignment gate dominates. Below id=0.75 the partition collapses to 2–4 mega-clusters that mix all genera indiscriminately (homogeneity ≈ 0.02): the "cliff" described below.*
+
+Specific findings:
+
+- At `identity_threshold = 0.75` and `minimizer_match_ratio = 0.05`: **40 clusters**, H(genus)=0.634, C(genus)=0.619. The best partial-genus result on the sweep, but H(genus)=0.63 means cross-genus merges are already happening (about a third of cluster mass comes from outside the dominant genus). C(genus)=0.62 means each genus is still split across multiple clusters.
+- At `identity_threshold ≤ 0.70` (any prefilter): **the partition collapses to 2–4 mega-clusters covering the whole input** (e.g., 4 clusters total at id=0.70, 2 clusters at id=0.50). H(genus) crashes to **0.02** — those mega-clusters mix all genera indiscriminately. There is no monotonic descent into a clean genus partition; the transition from "partial genus mode" (id=0.75) to "everything merges" (id=0.70) is a cliff.
+
+The mechanism: at id ≥ 0.80 the alignment gate itself blocks cross-genus pairs (real cross-genus 16S identity is ~75–85%), so loosening the prefilter doesn't help — both prefilter settings produce identical partitions at id ≥ 0.80. Below id=0.75 the alignment gate starts admitting cross-genus pairs, but it admits them indiscriminately because the underlying 16S signal at that level is too noisy for the greedy-minimizer design to discriminate genera apart.
+
+**Practical takeaway**: the validated dial covers strain (id=0.97) and partial-species (id=0.85–0.90). Anything coarser is not a supported mode of the clusterer on full-length 16S — even the best parameter combo we found gives H(genus) ≈ 0.63 with C(genus) ≈ 0.62, well below the ~0.95 threshold you'd want for a usable genus partition.
+
+**Validating your own runs**
+
+If you push `identity_threshold` away from the defaults, validate the partition before trusting it. Compute homogeneity and completeness against your ground-truth taxonomy with `sklearn.metrics.homogeneity_score` and `sklearn.metrics.completeness_score` — pass two parallel label vectors (truth taxon per input, predicted cluster ID per input). The benchmark script `python/sweep_taxonomy_clusterer.py` is a working template. **Don't rely on ARI alone** — it mashes over-merging and over-fragmentation into one number that can hit zero even when the partition is fine.
 
 #### Performance
 
@@ -406,24 +468,39 @@ Sequences are processed in **input order** (not sorted by length or abundance):
 
 Where:
 - **U** = number of unique sequences (after removing exact duplicates)
-- **C** = average number of candidate clusters per sequence (controlled by `min_shared_minimizers`)
+- **C** = average number of candidate clusters per sequence (controlled by `minimizer_match_ratio` — see Step 3)
 - **L** = average sequence length
 
 ---
 
 ### Diversity Analysis
 
-**Purpose**: Calculate genetic diversity metrics for each demultiplexed sample.
+**Purpose**: Calculate genetic diversity metrics for a set of reads against a reference database.
 
-This analysis combines your clustering results with demultiplexing results to measure diversity.
+A diversity job has **two independent input toggles** in the UI: a **Target Sequences Source** (the reference centroids reads are mapped *against*) and a **FASTQ Reads Source** (the reads to be mapped). Pick one option from each. An optional Exclude Sequences FASTA can also be attached.
 
 #### Required Inputs
 
-| Input | Description |
-|-------|-------------|
-| Cluster Result | Output from a previous Clustering job |
-| Demux Result | Output from a previous Demultiplexing job |
-| Exclude Sequences (optional) | FASTA file of sequences to filter out before diversity calculation |
+**Target Sequences Source** — pick one:
+
+| Option | Description |
+|--------|-------------|
+| Cluster Result | Output from a previous Clustering job on your reference / target FASTA. Provides centroids (one per cluster) as the reference database. |
+| Target FASTA File | A raw target-sequences FASTA. Each sequence is treated as its own cluster of size 1, so this is a quick alternative when you don't need clustering on the reference side. |
+
+**FASTQ Reads Source** — pick one:
+
+| Option | Description |
+|--------|-------------|
+| Demux Result | Output from a previous Demultiplexing job. Per-barcode reads are mapped, giving per-sample diversity. |
+| FASTQ File | A single uploaded FASTQ file, no demultiplexing. All reads are treated as one bulk `sample_all` group. |
+| Clustered Reads Result | Output from a previous Clustering job that was run on a FASTQ file. Each upstream centroid is used as a single query and its `member_count` is propagated as a weight, so abundance and diversity reflect the original read count rather than the deduplicated representatives. |
+
+**Optional:**
+
+| Option | Description |
+|--------|-------------|
+| Exclude Sequences | FASTA file of sequences to filter out before diversity calculation (host DNA, known contaminants, spike-ins, etc.). Reads matching anything here above `identity_threshold` are dropped. |
 
 #### Basic Parameters
 
@@ -433,18 +510,9 @@ This analysis combines your clustering results with demultiplexing results to me
 | Max Candidates | 1-100 | 10 | Maximum candidate clusters to consider per read |
 | Max Reads | 0+ | 0 (unlimited) | Limit number of reads to process (0 = all) |
 
-#### Advanced Feature: Read Pre-clustering
+#### Note: Read Deduplication Moved Upstream
 
-Enable "Pre-cluster reads before mapping" to group similar reads together before analysis. This can:
-- Reduce computational workload
-- Improve accuracy for high-error-rate sequencing (e.g., nanopore)
-
-| Parameter | Range | Default | Description |
-|-----------|-------|---------|-------------|
-| Read Cluster Identity Threshold | 0.85-1.0 | 0.95 | Similarity threshold for grouping reads |
-| Read Cluster K-mer Size | 5-31 | 11 | K-mer size for read clustering minimizers |
-| Read Cluster Window Size | 1-50 | 5 | Window size for read clustering minimizers |
-| Read Cluster Min Shared | 1-20 | 3 | Minimum shared minimizers for read clustering candidates |
+Pre-clustering reads before mapping (to deduplicate redundant reads and reduce BLAST queries on high-error-rate data) is no longer an option inside the diversity job. Run a **Clustering job on your FASTQ first** and then pass that result as the **Clustered Reads** input above — the upstream cluster's `identity_threshold`, `k`, `w`, and `minimizer_match_ratio` are now what control the deduplication behavior, and the `member_count` of each centroid becomes the per-read weight automatically.
 
 #### Outputs
 
@@ -452,9 +520,9 @@ For each barcode/sample:
 
 | Metric | Description |
 |--------|-------------|
-| Total Reads | Number of reads for this sample |
-| Read Clusters | Number of read clusters (if pre-clustering enabled) |
-| Duplicates Removed | Reads removed by pre-clustering |
+| Total Reads | Number of reads for this sample (weighted, when a Clustered Reads input is supplied) |
+| Read Clusters | Number of upstream read clusters used as queries (only when a Clustered Reads input is supplied) |
+| Duplicates Collapsed | Reads collapsed into upstream centroids by the Cluster Reads job (only when a Clustered Reads input is supplied) |
 | Mapped Reads | Reads successfully mapped to reference clusters |
 | Mapping Rate | Percentage of reads mapped |
 | Richness | Number of unique sequences detected |
@@ -488,18 +556,18 @@ When an exclude sequences FASTA is provided, a separate BLAST database is built 
 - Per-exclude-sequence statistics (read count, average identity) are tracked
 - Excluded reads are counted separately and do not contribute to diversity metrics
 
-**Step 4: Read Pre-clustering (Optional)**
+**Step 4: Optional Weighted Mapping from Clustered Reads**
 
-When enabled (`cluster_reads=true`), similar reads are grouped before BLAST mapping using the [Clustering module described above](#clustering):
-- More permissive parameters optimized for sequencing error tolerance: k=11, w=5, identity=0.85
-- Exact duplicate reads are removed first, then remaining unique reads are clustered
-- Only cluster representative sequences are submitted to BLAST
-- Read counts are weighted by cluster size in **abundance counts and diversity indices** (see callout below)
-- Reduces BLAST queries by 50-90% for redundant data
+When a **Clustered Reads** input is supplied (output of a Cluster Reads job on a FASTQ file), the analyzer reads its `clusters.json` and:
+- Uses each centroid sequence as the BLAST query (instead of every individual read)
+- Propagates the centroid's `member_count` as the weight on the resulting `ReadMapping.weight`, so abundance and diversity indices reflect the original input read count rather than the deduplicated representative count
+- Reduces BLAST queries by 50-90% for redundant data, particularly nanopore reads where many reads collapse into a single centroid
 
-> **What is and isn't weighted by pre-cluster size**
+When no Clustered Reads input is supplied, every read is mapped individually with weight 1 (no upstream weighting).
+
+> **What is and isn't weighted by upstream cluster size**
 >
-> When `cluster_reads=true`, pre-cluster sizes (which already include exact-dedup counts) are propagated through `ReadMapping.weight` and consumed by `AbundanceCalculator`. The resulting numbers split into two groups:
+> When a Clustered Reads input is supplied, upstream cluster sizes (which already include exact-dedup counts from the Cluster Reads job) are propagated through `ReadMapping.weight` and consumed by `AbundanceCalculator`. The resulting numbers split into two groups:
 >
 > **Weighted (reflects original input read count):**
 > - `Read_Count`, `Percent_Total` per cluster
@@ -509,7 +577,7 @@ When enabled (`cluster_reads=true`), similar reads are grouped before BLAST mapp
 > **NOT weighted (computed over representatives only):**
 > - `Avg_Identity`, `Avg_Read_Length`, `Avg_Read_Coverage_Pct`
 >
-> The "avg" columns are unweighted means over the cluster *representatives*, not the original reads. If a cluster represents 5,000 reads pre-clustered down to 100 representatives, `Avg_Identity` is the mean of 100 identity values, not 5,000. The reads collapsed into each representative contribute zero information to these averages — this is by design, since collapsed reads are never individually BLAST-aligned and so per-read identity simply doesn't exist for them.
+> The "avg" columns are unweighted means over the upstream *centroids*, not the original reads. If an upstream centroid represents 5,000 reads pre-clustered down to one query, `Avg_Identity` is one identity value contributing once to the mean, not 5,000 times. The reads collapsed into each upstream centroid contribute zero information to these averages — this is by design, since collapsed reads are never individually BLAST-aligned and so per-read identity simply doesn't exist for them.
 
 **Step 5: Read Mapping via BLAST**
 
@@ -539,6 +607,8 @@ For each batch of reads (batch size = 2,500):
 
 Temporary query and result files are cleaned up after each batch. The `/tmp` directory uses job-specific subdirectories to prevent collisions between concurrent analyses.
 
+**Parallelization:** BLAST runs with `-num_threads = available CPUs`. The edlib re-score over each read's candidate clusters (step 6 above) is also OpenMP-parallelized across reads inside the C++ `ReadMapper`, so re-verification scales with thread count rather than running serially per batch.
+
 **Step 6: Diversity Metric Calculation**
 
 For each barcode/sample, abundance is computed from weighted read-to-cluster mappings, then ecological diversity indices are calculated from the abundance distribution:
@@ -566,7 +636,7 @@ Evenness = 1.03 / ln(3) = 0.94
 **Step 7: Per-Barcode Output**
 
 For each barcode, the analyzer writes:
-- `{barcode}_abundance.tsv`: Cluster-level abundance table sorted by read count. Columns: `Cluster_ID`, `Centroid_Name`, `Read_Count` (weighted by pre-cluster size when `cluster_reads=true`), `Percent_Total` (weighted), `Avg_Identity` (unweighted; mean over representatives only when `cluster_reads=true`), `Avg_Read_Length` (unweighted), `Centroid_Length`, `Avg_Read_Coverage_Pct` (unweighted)
+- `{barcode}_abundance.tsv`: Cluster-level abundance table sorted by read count. Columns: `Cluster_ID`, `Centroid_Name`, `Read_Count` (weighted by upstream cluster size when a Clustered Reads input is supplied), `Percent_Total` (weighted), `Avg_Identity` (unweighted; mean over upstream centroids only when a Clustered Reads input is supplied), `Avg_Read_Length` (unweighted), `Centroid_Length`, `Avg_Read_Coverage_Pct` (unweighted)
 - `{barcode}_excluded_abundance.tsv` (if exclude sequences used): Per-exclude-sequence statistics
 - `diversity_metrics.tsv`: Global metrics table across all barcodes
 - `diversity_summary.txt`: Human-readable summary with per-barcode breakdown and top clusters
@@ -577,15 +647,19 @@ For each barcode, the analyzer writes:
 |--------|---------|
 | **Complexity** | O(N × log(K) × L) |
 | **Bottleneck** | BLAST alignment |
-| **Parallelization** | BLAST internal threading (`-num_threads`); barcodes processed sequentially |
+| **Parallelization** | BLAST internal threading (`-num_threads`); edlib re-score across candidate clusters parallelized via OpenMP; barcodes processed sequentially |
 | **Typical Speed** | Slowest of the three job types |
 
 Where:
-- **N** = number of reads to map (across all barcodes; reduced by pre-clustering)
+- **N** = number of reads to map (or upstream centroids, when a Clustered Reads input is supplied; can be 10-100× smaller than the raw read count)
 - **K** = number of clusters in the reference database
 - **L** = average sequence length
 
-> **Tip**: Enable read pre-clustering to reduce N by 10-100x, significantly speeding up analysis for large datasets.
+> **Tip**: For high-error nanopore data, run a Cluster Reads job on your FASTQ first and pass the output to Diversity as **Clustered Reads** — it dedupes redundant reads upstream, cutting BLAST queries 10-100× while preserving accurate abundance via per-centroid weights.
+
+> **What `identity_threshold` does here vs. in clustering**
+>
+> The diversity job's `identity_threshold` is an **acceptance / quality gate**, not a taxonomic-resolution dial — a read with edlib identity below this threshold is dropped from mapping (counted as unmapped), regardless of whether the closest centroid is the right strain or just a related species. Taxonomic resolution (genus / species / strain) is set upstream by the **clusterer's** `identity_threshold`, which determines how finely the reference DB is split. Tightening the diversity threshold from 0.95 to 0.99 doesn't reveal more strains; it just rejects more low-confidence mappings.
 
 ---
 
@@ -657,8 +731,10 @@ Here's a typical end-to-end analysis workflow:
 
 1. Create another job
 2. Select "Clustering"
-3. Choose your reference FASTA file
-4. Set identity threshold (e.g., 0.97 for species-level)
+3. Choose your input file. This can be either:
+   - Your **reference FASTA** (target / other sequences) — produces the cluster database used as the reference in Diversity Analysis.
+   - Your **FASTQ reads** — produces both a cluster database and a `Clustered Reads` archive that can be passed to Diversity Analysis for upstream-weighted mapping (recommended for nanopore data with many duplicate reads). When picking a FASTQ input, also set `Min Read Quality` to drop low-quality reads before clustering.
+4. Leave `identity_threshold` at the default of `0.97` — that's the validated sweet spot for deduping a curated reference FASTA at strain level (see Clustering → "Choosing parameters by target resolution"). Only adjust if you specifically need coarser-than-strain output.
 5. Click "Create Job"
 6. Wait for completion
 
@@ -666,8 +742,13 @@ Here's a typical end-to-end analysis workflow:
 
 1. Create another job
 2. Select "Diversity Analysis"
-3. Select your completed Cluster Result
-4. Select your completed Demux Result
+3. Pick a **Target Sequences Source**:
+   - Your completed **Cluster Result** (recommended — built from clustering your reference FASTA), OR
+   - A raw **Target FASTA File** directly (each sequence treated as a singleton cluster)
+4. Pick a **FASTQ Reads Source**:
+   - Your completed **Demux Result** for per-sample diversity, OR
+   - A FASTQ file directly for a single bulk sample, OR
+   - A **Clustered Reads** result (from Step 4 if you clustered your FASTQ reads) for weighted mapping with deduplication
 5. Adjust parameters if needed
 6. Click "Create Job"
 7. Wait for completion
@@ -696,13 +777,15 @@ Here's a typical end-to-end analysis workflow:
 - Adjust Minimum Quality Score based on your sequencing platform
 
 **For Clustering:**
-- Use 0.97 identity for species-level grouping
-- Use 0.99+ for strain-level resolution
-- Lower thresholds create fewer, larger clusters
+- The default `identity_threshold = 0.97` is calibrated to **dedupe a curated reference FASTA at strain level** — each distinct strain-level sequence becomes one cluster, validated on real NCBI 16S. Don't change it for the typical "prep a reference DB for downstream Diversity Analysis" workflow.
+- For **noisy reads** (Nanopore, raw FASTQ), 0.97 is also fine — the read-error rate is well within the acceptance window. The result still gives you per-strain-template clusters; downstream Diversity Analysis can use these as weighted queries.
+- For **coarser-than-strain output** (collapse strains within species), lower `identity_threshold` toward 0.85–0.90; the default prefilter is fine. Below 0.85 the partition stops getting cleaner — see *Clustering → "Choosing parameters by target resolution"* for the full story including what fails at lower identity values.
+- Don't rely on raw cluster counts or ARI alone to validate coarser-resolution output: check **homogeneity** (cluster purity) and **completeness** (taxa stay together) or eyeball the per-cluster member lists in `clusters.json`. ARI mashes both failure modes together and can hit zero on partitions that are otherwise fine.
 
 **For Diversity Analysis:**
-- Enable read pre-clustering for nanopore data (high error rate)
-- Use Max Reads to test parameters on a subset before full analysis
+- For high-error nanopore data, run a **Cluster Reads** job on your FASTQ first and pass that result as the **Clustered Reads** input — this dedupes redundant reads upstream and propagates per-centroid weights into abundance and diversity indices.
+- Remember that the diversity `identity_threshold` is an **acceptance gate** that rejects low-confidence mappings — it does *not* control whether reads are split at the genus, species, or strain level. That resolution is decided by the upstream clustering job's `identity_threshold` when you build your reference database.
+- Use Max Reads to test parameters on a subset before full analysis.
 
 ### Troubleshooting
 
