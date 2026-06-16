@@ -506,10 +506,6 @@ A diversity job has **two independent input toggles** in the UI: a **Target Sequ
 | Max Candidates | 1-100 | 10 | Maximum candidate clusters to consider per read |
 | Max Reads | 0+ | 0 (unlimited) | Limit number of reads to process (0 = all) |
 
-#### Note: Read Deduplication Moved Upstream
-
-Pre-clustering reads before mapping (to deduplicate redundant reads and reduce BLAST queries on high-error-rate data) is no longer an option inside the diversity job. Run a **Clustering job on your FASTQ first** and then pass that result as the **Clustered Reads** input above — the upstream cluster's `identity_threshold`, `k`, `w`, and `minimizer_match_ratio` are now what control the deduplication behavior, and the `member_count` of each centroid becomes the per-read weight automatically.
-
 #### Outputs
 
 For each barcode/sample:
@@ -544,6 +540,8 @@ A BLAST nucleotide database is created from cluster centroid sequences:
 - `makeblastdb -dbtype nucl -parse_seqids` creates the binary database
 - A reverse lookup map (hash → cluster ID) enables fast result parsing
 - The database is created once and reused across all barcodes
+
+Because identical sequence headers hash to identical BLAST IDs — which `-parse_seqids` rejects as duplicate `seq_id`s — the **Target FASTA** and **Exclude Sequences** FASTA are scanned for duplicate headers *before* the build. If any are found the job fails immediately and lists the offending accessions, rather than aborting partway through `makeblastdb` with an opaque error. Sequences with identical *content* but distinct headers are allowed (they only trigger a warning in the job log), since BLAST handles those fine.
 
 **Step 3: Exclude Sequence Filtering (Optional)**
 
@@ -617,6 +615,12 @@ For each barcode/sample, abundance is computed from weighted read-to-cluster map
 | **Pielou's Evenness (J')** | H' / ln(S) | How evenly reads are distributed (0–1); returns 0 when S ≤ 1 |
 
 Where **pᵢ = (weighted reads in cluster i) / (total mapped reads)**. Unmapped reads are excluded from diversity calculations. When read pre-clustering is enabled, all counts use the weighted values (cluster size × representative count). NaN and infinity safety checks are applied to all computed indices.
+
+> **Are duplicate reads counted as abundance?**
+>
+> Yes — intentionally. In the raw-read paths (**Demux Result**, **FASTQ File**), every read is mapped and counted individually, so *N* identical reads contribute *N* to their cluster's abundance and move the diversity indices accordingly. This is the standard amplicon convention — read count *is* abundance, the same model DADA2/QIIME use for ASV abundance — so a large population of the same physical template shows up as a dominant, high-abundance cluster. (Each read is assigned to exactly one cluster, so it is never double-counted across clusters.)
+>
+> The caveat: without UMIs the analyzer cannot distinguish **biological** duplicates (independent molecules) from **technical** ones (PCR or optical duplicates), so this is *read* abundance — subject to PCR amplification bias — not an absolute molecule count. If your library is UMI-tagged, or you specifically want PCR duplicates removed, deduplicate before uploading; the platform does not do it for you. The **Clustered Reads** path collapses exact *and near-identical* reads into weighted centroids (by the upstream clustering `identity_threshold`): it preserves exact-duplicate abundance but also folds in near-identical reads, so it can yield slightly different indices than the raw paths on the same data.
 
 **Example Calculation:**
 ```
@@ -764,6 +768,7 @@ Here's a typical end-to-end analysis workflow:
 - **Combine FASTQ files** from the same sample before uploading (see [FASTQ Concatenation Guide](fastq-concatenation-guide.md))
 - **Compress large files** using gzip for faster uploads
 - **Use descriptive names** for your files to easily identify them later
+- **Keep FASTA headers unique** in reference/target and exclude-sequence files — BLAST rejects duplicate sequence IDs, so duplicate headers will fail a Diversity job up front (the error names the duplicates)
 
 ### Parameter Tuning
 
@@ -789,6 +794,7 @@ Here's a typical end-to-end analysis workflow:
 |-------|---------------|----------|
 | Low barcode assignment rate | Barcodes not matching | Check barcode sequences, ensure reverse complements are in FASTA, enable both-ends mode, or increase max errors |
 | Job fails immediately | Invalid file format | Verify file is correctly formatted FASTQ/FASTA |
+| Diversity job fails early with "Failed to create BLAST database" | Duplicate sequence headers in the Target FASTA or Exclude Sequences FASTA (BLAST requires unique headers) | Remove or rename the duplicates and re-run — the job error message lists the offending accessions |
 | Very slow processing | Large file size | Use Max Reads to limit processing, or wait for completion |
 | No diversity results | No reads mapped | Check identity threshold, ensure reference matches your samples |
 
