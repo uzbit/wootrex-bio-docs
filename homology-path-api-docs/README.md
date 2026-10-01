@@ -79,6 +79,15 @@ Provided that a valid JSON object containing sequence name to custom cut positio
         'seq2': [150, 2005]
         }`
 Sequence 'seq1' will have oligos that start/end at positions 50, 900, 1040; and 'seq2' will have oligos that start/end at 150, 2005. This is available only for design_type = "minimize_complexity" or "gapped_design".
+    - **vector_5p**: String, default is empty.
+    - **vector_3p**: String, default is empty.
+The two ends of the linearized vector the sequences are being cloned into, as unambiguous DNA. Give them and every sequence is designed as the whole construct it becomes once the vector closes: **vector_3p + sequence + vector_5p**. A linearized vector reads 5'-A...B-3' and circularizes as B-sequence-A, so the end that goes in front of your sequence is the vector's *3'* end. Either may be given on its own, which leaves the other side of the sequence bare; giving neither, the default, designs the sequences exactly as submitted.
+
+One vector serves the whole design, which is what makes the oligos covering its ends worth sharing: they are ordered for the design rather than again for each sequence. On a nine sequence test set, 100 bases at each end adds 1800 bases of vector across the design but only about 350 bases to the order. Available for every design type. Note:
+      - The amplification primers are designed on the constructs, so they sit on the vector and the whole design shares a single primer pair instead of one pair per sequence. **target_primer_length** may therefore not exceed the length of the end the primer would sit on, and a request that asks for that is rejected.
+      - `Cut Position` in `Oligo Info`, and `Overlap Start`/`Overlap End` in `Overlap Info`, are positions on the construct, vector ends included, since that is what the oligos tile. The `Sequence Info` tab of the design file gains `Sequence Start` and `Sequence End` columns giving where your submitted sequence sits inside its construct.
+      - Complexity findings (see **compute_complexity_for_design**) that lie wholly inside a vector end are prefixed `[vector end]`. They are reported rather than dropped, because a hairpin in vector sequence is still a hairpin in an oligo about to be ordered, but no choice of cut positions can change vector sequence, so they are not faults in the design.
+      - The maximum base pair limit applies to the constructs, as the vector ends are bases being ordered too. Both ends are recorded in `Run Info.Parameters`, so a finished job says which vector it was designed for.
     - The following parameters are used for the TM calculation only for Design Types "minimize_complexity" and "gapped_design". The NA + K are used in the ΔG calculations, where all of the following are used in TM overlap optimizations. These should correspond to your experimental conditions as best possible. Refer to the [BioPython documentation](https://biopython.org/docs/1.75/api/Bio.SeqUtils.MeltingTemp.html#Bio.SeqUtils.MeltingTemp.Tm_GC) for more information. All units are concentrations.
       - **dnac1**: Float, default 25.0 nM
       - **dnac2**: Float, default 25.0 nM
